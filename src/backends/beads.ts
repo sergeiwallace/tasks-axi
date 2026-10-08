@@ -260,6 +260,9 @@ export class BeadsStore implements Store {
       customStates: false,
       serverMintsIds: false,
       publicFollowups: false,
+      // PR #54's capability, declared false until `transferMany` lands for
+      // graph-to-graph moves; the command layer refuses rather than exporting.
+      collectionTransfer: false,
     };
   }
 

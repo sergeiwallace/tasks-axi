@@ -34,7 +34,12 @@ export function resolveTasksContext(
   };
 }
 
-function createStore(config: ResolvedConfig): Store {
+/**
+ * Build the Store a resolved config selects. Command code calls this instead of
+ * constructing a backend directly, so a command that needs a second store (mv's
+ * destination backlog) stays as backend-agnostic as the rest of the CLI layer.
+ */
+export function createStore(config: ResolvedConfig): Store {
   if (config.backend === "markdown") {
     return new MarkdownStore({
       path: config.path,
