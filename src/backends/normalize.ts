@@ -1,8 +1,9 @@
 import { AxiError } from "../errors.js";
 import { validateDependencyId } from "../id.js";
-import type { Dep, Hold, TaskLink } from "../model.js";
+import type { Dep, Hold, Task, TaskInput, TaskLink } from "../model.js";
 import { HOLD_KINDS } from "../model.js";
 import { PR_URL_EXPECTED } from "../pr-url.js";
+import { clonePublicFollowup } from "../public-followup.js";
 import { deriveLinks, extractTags } from "./markdown-grammar.js";
 
 /**
@@ -11,12 +12,40 @@ import { deriveLinks, extractTags } from "./markdown-grammar.js";
  * The grammar-shaped constraints (single-line values, no parentheses in tag
  * values, canonical-tag-free titles) are deliberately kept for non-markdown
  * backends too: they guarantee any task can be rendered into the canonical
- * markdown form (used by the beads backend's mirror and by `mv`).
+ * markdown form, which `mv` relies on.
  */
 
 export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DEP_REASON_EDGE_MARKER_RE =
   /(?:^|\s)(?:blocked-by|parent|discovered-from):\s/;
+
+/**
+ * Round-trip a stored Task back into the input shape a `create` accepts, so
+ * relocating a task between collections reproduces every field rather than the
+ * subset a caller happened to pass. `created` is sent explicitly as `null` when
+ * absent so a backend cannot backfill today's date onto an older task.
+ */
+export function taskToInput(task: Task): TaskInput {
+  const input: TaskInput = {
+    id: task.id,
+    title: task.title,
+    state: task.state,
+    deps: task.deps.map((dep) => ({ ...dep })),
+    links: task.links.map((link) => ({ ...link })),
+  };
+  if (task.kind) input.kind = task.kind;
+  if (task.repo) input.repo = task.repo;
+  if (task.body) input.body = task.body;
+  if (task.hold) input.hold = { ...task.hold };
+  if (task.priority !== undefined) input.priority = task.priority;
+  input.created = task.created ?? null;
+  if (task.closed) input.closed = task.closed;
+  if (task.public_followup) {
+    input.public_followup = clonePublicFollowup(task.public_followup);
+  }
+  if (task.meta) input.meta = { ...task.meta };
+  return input;
+}
 
 export function normalizeTitle(title: string): string {
   if (/[\r\n]/.test(title)) {

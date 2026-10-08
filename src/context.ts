@@ -1,4 +1,3 @@
-import { dirname } from "node:path";
 import { BeadsStore } from "./backends/beads.js";
 import { MarkdownStore } from "./backends/markdown.js";
 import {
@@ -47,12 +46,13 @@ export function createStore(config: ResolvedConfig): Store {
     });
   }
   if (config.backend === "beads") {
-    // `path` doubles as the canonical-markdown mirror the beads backend keeps.
+    // A beads home is addressed by its `.beads` directory alone. No markdown
+    // path reaches the adapter: the graph is the sole record, so there is
+    // nothing to mirror and no archive file to write.
     return new BeadsStore({
-      mirrorPath: config.path,
-      dir: config.beads?.dir ?? dirname(config.path),
-      ...(config.beads?.bin ? { bin: config.beads.bin } : {}),
-      ...(config.archivePath ? { archivePath: config.archivePath } : {}),
+      path: config.beads.path,
+      binary: config.beads.binary,
+      ...(config.beads.prefix ? { prefix: config.beads.prefix } : {}),
     });
   }
   throw new AxiError(

@@ -267,24 +267,23 @@ Beads becomes the source of truth: dependency graph, priorities, full history, a
 # .tasks.toml
 backend = "beads"
 
-[markdown]
-path = "data/backlog.md"   # the mirror location (see below)
-
 [beads]
-dir = "data"               # directory holding .beads/ (default: the mirror's directory)
-bin = "bd"                 # optional bd binary override
+path = ".beads"            # the .beads directory itself (default: ./.beads)
+binary = "bd"              # optional bd binary override
+prefix = "AIH"             # optional: resolve a bare id against this graph prefix
 ```
 
-After every mutation the backend rewrites the configured markdown path as a **read-only canonical mirror** of the active backlog, byte-compatible with the markdown backend's format, so tools that read `backlog.md` directly keep working unchanged.
-Hand-edits to the mirror are overwritten; mutate through tasks-axi (or `bd`, then `tasks-axi render` to refresh the mirror).
-tasks-axi fields that beads has no column for (kind, repo, holds, canonical dates, dependency reasons) live in a `tasks_axi` object inside each issue's metadata; a hold with `--until` also sets bd's defer date.
-`prune` archives surplus Done tasks to `done-archive.md` and hides them from tasks-axi with a metadata flag while beads retains the full record.
-`--archive-body` preserves the superseded body both in `note-archive.md` (the shared file contract) and as a bd comment on the issue, so the history stays visible from bd-native views.
-`create`, `update`, and every state transition are verified by reading the task back from bd and comparing the persisted fields, so a bd invocation that exits 0 without applying the change surfaces as a structured error instead of silent divergence.
-bd stores one relationship type per task pair, so adding a `blocked-by` edge to an id that already carries a `parent` or `discovered-from` edge (or vice versa) fails with a `VALIDATION_ERROR` naming the existing edge; remove that edge first.
-`ready`/`blocked`/`held` stay derived by the CLI from the dependency graph, so they are correct even where `bd ready` itself is not (bd 1.2.2 mis-reads blockers on issues whose id prefix differs from the database prefix).
-tasks-axi mutations serialize under an advisory lock on the mirror path and fail closed with a `LOCKED` error on contention, just like the markdown backend; raw `bd` writers bypass that lock, and `bd create --id <id> --force` silently overwrites an existing issue, so create ids through tasks-axi when both are in play.
-Public-followups and multi-task `mv` are not supported on this backend.
+**The graph is the sole record.** Nothing mirrors it into a markdown backlog: there is no mirror file, no `note-archive.md` write and no markdown archive, and an unresolvable graph raises a structured error naming the path rather than falling back to a `.md` file.
+`[beads] path` names the `.beads` directory; the adapter addresses it as `bd -C <its parent>`, which works from any cwd and from a linked git worktree. PR #52's `dir` / `bin` keys are still accepted as deprecated aliases (`dir` named the directory *holding* `.beads`).
+tasks-axi fields that beads has no column for (kind, repo, holds, canonical dates, dependency reasons, public obligations) live in flat `axi.*` metadata keys. Every mutation sends all owned keys in **one** `bd` call, using an explicit JSON `null` as a tombstone, because bd refuses to combine `--metadata` with `--unset-metadata` — so a hold or a delivery is never observable half-written.
+`--archive-body` keeps the superseded body inside Beads, appended to an `axi.body_archive` history rather than to a file.
+`reopen` keeps the original completion stamp: `bd update -s open` clears bd's own `closed_at` *and* `close_reason`, so the durable stamp lives in `axi.closed` and is carried through explicitly.
+`remove` refuses a task that still blocks active work. bd's own `delete --force` would delete it and silently drop the dependents' edges despite its help claiming otherwise, so the guard lives in the adapter, before the delete.
+`ready`/`blocked`/`held` stay derived by the CLI from the dependency graph, so they are correct even where `bd ready` itself is not.
+`prune` and `render` are **not** offered (`capabilities().prune` is false): both would mean inventing an archive or an export file beside an authoritative graph, so the CLI names the missing capability instead.
+Public-followups **are** supported: the whole typed obligation is one base64url payload in `axi.public_followup`, so a revision bump and an atomic completion travel in a single write.
+`mv` moves a connected set between two Beads graphs through the `collectionTransfer` capability — `--to` names another repository holding a `.beads` directory (or that directory itself). Crossing record types is refused by name in both directions: a beads graph never exports into a markdown backlog, and a markdown backlog never writes into a graph.
+Dolt synchronization is deliberately outside adapter calls (`capabilities().realtimeSync` is false), so no lifecycle command can fail on the network or on credentials; `BD_NO_REMOTE_ADOPT=1` and `BD_EXPORT_GIT_ADD=false` are set on every invocation so bd neither adopts a remote into tracked config nor stages its own export.
 
 ## Development
 

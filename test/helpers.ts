@@ -56,7 +56,12 @@ export function makeBacklog(
   const store = new MarkdownStore({ path, now: () => now });
   const ctx: TasksContext = {
     store,
-    config: { backend: "markdown", path, doneKeep: 10 },
+    config: {
+      backend: "markdown",
+      path,
+      doneKeep: 10,
+      beads: { path: join(dir, ".beads"), binary: "bd" },
+    },
   };
   return {
     dir,

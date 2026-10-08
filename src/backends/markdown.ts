@@ -30,7 +30,6 @@ import {
   assertPublicFollowupMutation,
   assertPublicFollowupTaskState,
   canonicalEqual,
-  clonePublicFollowup,
   isPublicFollowupTask,
   isPublicFollowupTerminal,
   normalizePublicFollowup,
@@ -65,6 +64,7 @@ import {
   normalizeTitle,
   sameHold,
   sameMeta,
+  taskToInput,
 } from "./normalize.js";
 
 export interface MarkdownStoreOptions {
@@ -106,28 +106,6 @@ function errno(error: unknown): string {
   return error && typeof error === "object" && "code" in error
     ? String((error as NodeJS.ErrnoException).code)
     : "UNKNOWN";
-}
-
-function taskToInput(task: Task): TaskInput {
-  const input: TaskInput = {
-    id: task.id,
-    title: task.title,
-    state: task.state,
-    deps: task.deps.map((dep) => ({ ...dep })),
-    links: task.links.map((link) => ({ ...link })),
-  };
-  if (task.kind) input.kind = task.kind;
-  if (task.repo) input.repo = task.repo;
-  if (task.body) input.body = task.body;
-  if (task.hold) input.hold = { ...task.hold };
-  if (task.priority !== undefined) input.priority = task.priority;
-  input.created = task.created ?? null;
-  if (task.closed) input.closed = task.closed;
-  if (task.public_followup) {
-    input.public_followup = clonePublicFollowup(task.public_followup);
-  }
-  if (task.meta) input.meta = { ...task.meta };
-  return input;
 }
 
 export class MarkdownStore implements Store {

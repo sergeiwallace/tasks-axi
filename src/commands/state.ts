@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import {
   parseNonNegativeIntegerFlag,
@@ -11,6 +11,8 @@ import {
   takeFlag,
 } from "../args.js";
 import { renderMutation, stateLabel, taskToJson } from "../confirm.js";
+import { taskToInput } from "../backends/normalize.js";
+import type { ResolvedConfig } from "../config.js";
 import { createStore, requireCtx, type TasksContext } from "../context.js";
 import {
   blockedIds,
@@ -32,15 +34,11 @@ import type {
   Hold,
   HoldKind,
   Task,
-  TaskInput,
   TaskLink,
   TaskPatch,
 } from "../model.js";
 import { HOLD_KINDS } from "../model.js";
-import {
-  PUBLIC_FOLLOWUP_KIND,
-  clonePublicFollowup,
-} from "../public-followup.js";
+import { PUBLIC_FOLLOWUP_KIND } from "../public-followup.js";
 import type { Store } from "../store.js";
 import { getSuggestions } from "../suggestions.js";
 import { renderHelp, renderOutput } from "../toon.js";
@@ -104,6 +102,9 @@ List unblocked, unheld queued work dispatchable right now.
 Public-followup obligations are never dispatchable and appear only in the separate
 ready_public_followups group; use tasks-axi public-followup ready for their full payloads.
 Held work is excluded by default; --include-held shows it in a separate held group.`;
+
+/** The graph directory name a beads `--to` destination is resolved against. */
+const BEADS_DIR = ".beads";
 
 export const MV_HELP = `usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>
 Move one or more tasks to another backlog file in a single atomic transaction.
@@ -726,6 +727,63 @@ async function undoStagedCopy(
   throw cause;
 }
 
+/**
+ * What `--to` denotes depends on the active backend, so the destination is
+ * resolved against it rather than assumed to be a markdown file.
+ *
+ * For a beads home it names ANOTHER `.beads` graph — the narrowest reading
+ * that keeps Beads the sole record. Crossing the two record types is refused
+ * in both directions and by name: moving out of a graph into a markdown
+ * backlog would export the task out of the authoritative store, and moving a
+ * markdown task into a graph would silently change which store owns it.
+ */
+function resolveMoveDestination(
+  config: ResolvedConfig,
+  to: string,
+): { config: ResolvedConfig; path: string; current: string } {
+  const base = isAbsolute(to) ? to : resolve(process.cwd(), to);
+
+  if (config.backend === "beads") {
+    if (base.endsWith(".md")) throw crossRecordMoveError(to, "beads");
+    const graph = basename(base) === BEADS_DIR ? base : resolve(base, BEADS_DIR);
+    if (!existsSync(graph) || !statSync(graph).isDirectory()) {
+      throw new AxiError(
+        `--to "${to}" does not name a beads graph`,
+        "VALIDATION_ERROR",
+        [
+          `Point --to at a repository holding a ${BEADS_DIR} directory, or at the ${BEADS_DIR} directory itself`,
+          "There is no markdown fallback for the beads backend",
+        ],
+      );
+    }
+    return {
+      config: { ...config, beads: { ...config.beads, path: graph } },
+      path: graph,
+      current: config.beads.path,
+    };
+  }
+
+  if (basename(base) === BEADS_DIR) throw crossRecordMoveError(to, "markdown");
+  const path = resolveBacklogTarget(to);
+  return {
+    config: { backend: config.backend, path, doneKeep: config.doneKeep, beads: config.beads },
+    path,
+    current: config.path,
+  };
+}
+
+function crossRecordMoveError(to: string, backend: string): AxiError {
+  return new AxiError(
+    `--to "${to}" names a ${backend === "beads" ? "markdown backlog" : "beads graph"}, which the "${backend}" backend cannot move tasks into: the two keep separate records and a move across them would change which store owns the task`,
+    "UNSUPPORTED",
+    [
+      backend === "beads"
+        ? `Name another ${BEADS_DIR} graph, e.g. \`--to ../other-repo\``
+        : "Name another markdown backlog, e.g. `--to ../other/data/backlog.md`",
+    ],
+  );
+}
+
 function resolveBacklogTarget(to: string): string {
   const base = isAbsolute(to) ? to : resolve(process.cwd(), to);
   if (existsSync(base) && statSync(base).isDirectory()) {
@@ -736,28 +794,6 @@ function resolveBacklogTarget(to: string): string {
     return resolve(base, "data/backlog.md");
   }
   return base;
-}
-
-function taskToInput(task: Task): TaskInput {
-  const input: TaskInput = {
-    id: task.id,
-    title: task.title,
-    state: task.state,
-    deps: task.deps.map((dep) => ({ ...dep })),
-    links: task.links.map((link) => ({ ...link })),
-  };
-  if (task.kind) input.kind = task.kind;
-  if (task.repo) input.repo = task.repo;
-  if (task.body) input.body = task.body;
-  if (task.hold) input.hold = { ...task.hold };
-  if (task.priority !== undefined) input.priority = task.priority;
-  input.created = task.created ?? null;
-  if (task.closed) input.closed = task.closed;
-  if (task.public_followup) {
-    input.public_followup = clonePublicFollowup(task.public_followup);
-  }
-  if (task.meta) input.meta = { ...task.meta };
-  return input;
 }
 
 export async function mvCommand(
@@ -783,8 +819,9 @@ export async function mvCommand(
   }
   const ids = [...new Set(positionals.map((p) => requireId(p, "id")))];
 
-  const targetPath = resolveBacklogTarget(to);
-  if (resolve(targetPath) === resolve(config.path)) {
+  const destination = resolveMoveDestination(config, to);
+  const targetPath = destination.path;
+  if (resolve(targetPath) === resolve(destination.current)) {
     throw new AxiError(
       "--to resolves to the current backlog",
       "VALIDATION_ERROR",
@@ -798,11 +835,7 @@ export async function mvCommand(
     tasks.push(task);
   }
 
-  const target = createStore({
-    backend: config.backend,
-    path: targetPath,
-    doneKeep: config.doneKeep,
-  });
+  const target = createStore(destination.config);
   for (const id of ids) {
     if (await target.get(id)) {
       throw new AxiError(
@@ -853,7 +886,7 @@ export async function mvCommand(
       ok: true,
       action: "mv",
       ...(single ? { id: ids[0] } : { ids }),
-      from: config.path,
+      from: destination.current,
       to: targetPath,
     },
     suggestions: getSuggestions({

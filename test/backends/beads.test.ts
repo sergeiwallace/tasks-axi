@@ -1,720 +1,799 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { parseBacklog } from "../../src/backends/markdown-grammar.js";
-import { parseConfigToml, resolveConfig } from "../../src/config.js";
-import { resolveTasksContext } from "../../src/context.js";
-import { AxiError } from "../../src/errors.js";
-import {
-  BD_AVAILABLE,
-  makeBeadsBacklog,
-  type TempBeadsBacklog,
-} from "../beads-helpers.js";
-import { BeadsStore } from "../../src/backends/beads.js";
-import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { BeadsStore } from "../../src/backends/beads.js";
+import { MarkdownStore } from "../../src/backends/markdown.js";
+import { mvCommand } from "../../src/commands/state.js";
+import { AxiError } from "../../src/errors.js";
+import type { DepType, State } from "../../src/model.js";
+import type { Store } from "../../src/store.js";
+import {
+  parseConfigToml,
+  resolveConfig,
+  type ResolvedConfig,
+} from "../../src/config.js";
+import {
+  resolveTasksContext,
+  type TasksContext,
+} from "../../src/context.js";
 
-const IT_TIMEOUT = 60_000;
-const HOOK_TIMEOUT = 180_000;
+/**
+ * Contract tests for the Beads-backed store (AIH-nta1e).
+ *
+ * These run against a DISPOSABLE Beads graph created in a temp directory and
+ * freeze the Task-to-Beads mapping table as executable assertions. Every
+ * mapping assertion reads the stored Beads record back through `bd` itself, so
+ * a mapping claim is checked against the real store rather than against this
+ * adapter's own normalizer.
+ *
+ * The graph is created with the store-only `bd init` invocation the fleet
+ * wrapper uses (`--skip-agents --skip-hooks --non-interactive`), which keeps bd
+ * from injecting per-repo context files or seizing core.hooksPath. The graph is
+ * embedded and local: no Dolt server is contacted.
+ */
 
-// ---------------------------------------------------------------------------
-// bd-free tests: config + context wiring
-// ---------------------------------------------------------------------------
+// Each case drives several real `bd` invocations against an embedded Dolt
+// store; the 5s default is a harness limit, not a contract.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 180_000 });
 
-describe("beads config", () => {
-  it("parses the [beads] table", () => {
-    const config = parseConfigToml(
-      ['backend = "beads"', "[beads]", 'dir = "data"', 'bin = "/opt/bd"'].join(
-        "\n",
-      ),
-    );
-    expect(config.backend).toBe("beads");
-    expect(config.beads).toEqual({ dir: "data", bin: "/opt/bd" });
-  });
+const BD_ENV = {
+  ...process.env,
+  BD_EXPORT_GIT_ADD: "false",
+  BD_NO_REMOTE_ADOPT: "1",
+  BD_NO_DEP_TYPE_WARNING: "1",
+};
 
-  it("resolves beads.dir relative to the project", () => {
-    const dir = mkdtempSync(join(tmpdir(), "tasks-axi-beads-config-"));
-    try {
-      writeFileSync(
-        join(dir, ".tasks.toml"),
-        ['backend = "beads"', "[beads]", 'dir = "data"'].join("\n"),
-        "utf8",
-      );
-      const config = resolveConfig({ cwd: dir, home: dir, env: {} });
-      expect(config.backend).toBe("beads");
-      expect(config.beads?.dir).toBe(join(dir, "data"));
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+function hasBd(): boolean {
+  const probe = spawnSync("bd", ["version"], { encoding: "utf8" });
+  return !probe.error && probe.status === 0;
+}
 
-  it("resolves a BeadsStore context for backend=beads", () => {
-    const dir = mkdtempSync(join(tmpdir(), "tasks-axi-beads-ctx-"));
-    try {
-      const ctx = resolveTasksContext({
-        backend: "beads",
-        cwd: dir,
-        home: dir,
-        env: {},
-      });
-      expect(ctx.store).toBeInstanceOf(BeadsStore);
-      expect(ctx.store.capabilities().backend).toBe("beads");
-      expect(ctx.store.capabilities().publicFollowups).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+const BD_AVAILABLE = hasBd();
 
-  it("names both backends on an unknown backend", () => {
-    expect(() =>
-      resolveTasksContext({ backend: "sqlite", cwd: tmpdir(), env: {} }),
-    ).toThrowError(/available backends: markdown, beads/);
-  });
-});
+interface Graph {
+  repo: string;
+  beadsDir: string;
+}
 
-// ---------------------------------------------------------------------------
-// Real-bd Store conformance
-// ---------------------------------------------------------------------------
+function makeGraph(): Graph {
+  const repo = mkdtempSync(join(tmpdir(), "tasks-axi-beads-"));
+  const git = (args: string[]) =>
+    spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+  git(["init", "-q"]);
+  git(["config", "user.email", "spike@local"]);
+  git(["config", "user.name", "Spike"]);
+  const init = spawnSync(
+    "bd",
+    [
+      "init",
+      "--prefix",
+      "SPIKE",
+      "--skip-agents",
+      "--skip-hooks",
+      "--non-interactive",
+    ],
+    { cwd: repo, encoding: "utf8", env: BD_ENV },
+  );
+  if (init.status !== 0) {
+    throw new Error(`bd init failed: ${init.stderr || init.stdout}`);
+  }
+  return { repo, beadsDir: join(repo, ".beads") };
+}
 
-describe.skipIf(!BD_AVAILABLE)("BeadsStore CRUD", () => {
-  let bl: TempBeadsBacklog;
+/** Read a raw Beads record straight from bd, bypassing the adapter. */
+function rawShow(graph: Graph, id: string): Record<string, unknown> {
+  const result = spawnSync(
+    "bd",
+    ["-C", graph.repo, "show", id, "--json"],
+    { encoding: "utf8", env: BD_ENV },
+  );
+  if (result.status !== 0) {
+    throw new Error(`bd show ${id} failed: ${result.stderr}`);
+  }
+  const parsed = JSON.parse(result.stdout);
+  return (Array.isArray(parsed) ? parsed[0] : parsed) as Record<
+    string,
+    unknown
+  >;
+}
+
+function metadataOf(graph: Graph, id: string): Record<string, unknown> {
+  return (rawShow(graph, id).metadata ?? {}) as Record<string, unknown>;
+}
+
+describe.skipIf(!BD_AVAILABLE)("BeadsStore against a disposable graph", () => {
+  let graph: Graph;
+  let store: BeadsStore;
+
   beforeAll(() => {
-    bl = makeBeadsBacklog();
-  }, HOOK_TIMEOUT);
-  afterAll(() => bl.cleanup());
-
-  it(
-    "create round-trips every field and writes the mirror",
-    async () => {
-      const created = await bl.store.create({
-        id: "alpha-a1",
-        title: "ship the widget",
-        kind: "ship",
-        repo: "widgets",
-        priority: 2,
-        body: "first paragraph\n\nsecond paragraph",
-      });
-      expect(created.state).toBe("queued");
-      expect(created.created).toBe("2026-07-01");
-
-      const task = await bl.store.get("alpha-a1");
-      expect(task).not.toBeNull();
-      expect(task?.title).toBe("ship the widget");
-      expect(task?.kind).toBe("ship");
-      expect(task?.repo).toBe("widgets");
-      expect(task?.priority).toBe(2);
-      expect(task?.body).toBe("first paragraph\n\nsecond paragraph");
-      expect(task?.created).toBe("2026-07-01");
-
-      const mirror = bl.mirror();
-      expect(mirror).toContain("## Queued");
-      expect(mirror).toContain(
-        "- [ ] alpha-a1 - ship the widget (repo: widgets) (kind: ship) (priority: 2) (since 2026-07-01)",
-      );
-      expect(mirror).toContain("  first paragraph");
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "rejects a duplicate id with CONFLICT",
-    async () => {
-      await expect(
-        bl.store.create({ id: "alpha-a1", title: "again" }),
-      ).rejects.toMatchObject({ code: "CONFLICT" });
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "creates in_flight work under the In flight section",
-    async () => {
-      await bl.store.create({
-        id: "alpha-a2",
-        title: "started work",
-        state: "in_flight",
-      });
-      const task = await bl.store.get("alpha-a2");
-      expect(task?.state).toBe("in_flight");
-      const mirror = bl.mirror();
-      const inFlight = mirror.indexOf("## In flight");
-      const queued = mirror.indexOf("## Queued");
-      const line = mirror.indexOf("- [ ] alpha-a2 - started work");
-      expect(line).toBeGreaterThan(inFlight);
-      expect(line).toBeLessThan(queued);
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "validates create-time deps",
-    async () => {
-      await expect(
-        bl.store.create({
-          id: "alpha-a3",
-          title: "with dangling dep",
-          deps: [{ type: "blocked-by", id: "missing-m1" }],
-        }),
-      ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
-      await expect(
-        bl.store.create({
-          id: "alpha-a4",
-          title: "self block",
-          deps: [{ type: "blocked-by", id: "alpha-a4" }],
-        }),
-      ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
-
-      const created = await bl.store.create({
-        id: "alpha-a5",
-        title: "blocked work",
-        deps: [{ type: "blocked-by", id: "alpha-a1", reason: "waits on a1" }],
-      });
-      expect(created.deps).toEqual([
-        { type: "blocked-by", id: "alpha-a1", reason: "waits on a1" },
-      ]);
-      const task = await bl.store.get("alpha-a5");
-      expect(task?.deps).toEqual([
-        { type: "blocked-by", id: "alpha-a1", reason: "waits on a1" },
-      ]);
-      expect(bl.mirror()).toContain(
-        "- [ ] alpha-a5 - blocked work (since 2026-07-01) blocked-by: alpha-a1 - waits on a1",
-      );
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "lists with filters and in_flight-first order",
-    async () => {
-      const { items, total } = await bl.store.list({});
-      expect(total).toBeGreaterThanOrEqual(3);
-      expect(items[0].id).toBe("alpha-a2");
-      const ships = await bl.store.list({ kind: "ship" });
-      expect(ships.items.map((t) => t.id)).toEqual(["alpha-a1"]);
-      const limited = await bl.store.list({ limit: 1 });
-      expect(limited.items).toHaveLength(1);
-      expect(limited.total).toBe(total);
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "refuses public-followups as unsupported",
-    async () => {
-      await expect(
-        bl.store.create({
-          id: "pf-x1",
-          title: "promise",
-          kind: "public-followup",
-        }),
-      ).rejects.toMatchObject({ code: "UNSUPPORTED" });
-      await expect(bl.store.updatePublicFollowup()).rejects.toMatchObject({
-        code: "UNSUPPORTED",
-      });
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "removes an unblocking task and protects a blocking one",
-    async () => {
-      await expect(bl.store.remove("alpha-a1")).rejects.toMatchObject({
-        code: "VALIDATION_ERROR",
-      });
-      const removed = await bl.store.remove("alpha-a5");
-      expect(removed.id).toBe("alpha-a5");
-      expect(await bl.store.get("alpha-a5")).toBeNull();
-      const gone = await bl.store.remove("alpha-a1");
-      expect(gone.id).toBe("alpha-a1");
-      expect(bl.mirror()).not.toContain("alpha-a1");
-    },
-    IT_TIMEOUT,
-  );
-});
-
-describe.skipIf(!BD_AVAILABLE)("BeadsStore update", () => {
-  let bl: TempBeadsBacklog;
-  beforeAll(async () => {
-    bl = makeBeadsBacklog();
-    await bl.store.create({
-      id: "upd-u1",
-      title: "original title",
-      body: "original body",
+    graph = makeGraph();
+    store = new BeadsStore({
+      path: graph.beadsDir,
+      binary: "bd",
+      now: () => "2026-07-01",
     });
-  }, HOOK_TIMEOUT);
-  afterAll(() => bl.cleanup());
+  }, 120_000);
 
-  it(
-    "updates scalar fields and reports changed",
-    async () => {
-      const result = await bl.store.update("upd-u1", {
-        title: "new title",
-        repo: "widgets",
-        kind: "scout",
-        priority: 1,
-      });
-      expect(result.changed.sort()).toEqual([
-        "kind",
-        "priority",
-        "repo",
-        "title",
-      ]);
-      const task = await bl.store.get("upd-u1");
-      expect(task?.title).toBe("new title");
-      expect(task?.repo).toBe("widgets");
-      expect(task?.kind).toBe("scout");
-      expect(task?.priority).toBe(1);
+  afterAll(() => {
+    if (graph?.repo) rmSync(graph.repo, { recursive: true, force: true });
+  });
+
+  it("test_capabilities_when_beads_backend_then_deps_and_custom_states_true", () => {
+    const caps = store.capabilities();
+    expect(caps.backend).toBe("beads");
+    expect(caps.deps).toBe(true);
+    expect(caps.customStates).toBe(true);
+    expect(caps.publicFollowups).toBe(true);
+    // prune/render stay unsupported through the documented capability
+    // boundary: they are absent, so the CLI names the missing capability.
+    expect(caps.prune).toBe(false);
+    const asStore: Store = store;
+    expect(asStore.prune).toBeUndefined();
+    expect(asStore.render).toBeUndefined();
+  });
+
+  it("test_create_when_caller_supplies_id_then_beads_stores_it_verbatim", async () => {
+    const task = await store.create({
+      id: "homemux-h7",
+      title: "Wire the homemux pane",
+      kind: "ship",
+      repo: "firstmate",
+      body: "First line\nSecond line",
+      priority: 1,
+    });
+    expect(task.id).toBe("homemux-h7");
+
+    // A tasks-axi id does not match the graph prefix; it must still survive.
+    const raw = rawShow(graph, "homemux-h7");
+    expect(raw.id).toBe("homemux-h7");
+    expect(raw.title).toBe("Wire the homemux pane");
+    expect(raw.description).toBe("First line\nSecond line");
+    expect(raw.priority).toBe(1);
+  });
+
+  it("test_create_mapping_when_kind_and_repo_set_then_namespaced_metadata", () => {
+    const meta = metadataOf(graph, "homemux-h7");
+    expect(meta["axi.kind"]).toBe("ship");
+    expect(meta["axi.repo"]).toBe("firstmate");
+    expect(meta["axi.created"]).toBe("2026-07-01");
+  });
+
+  it("test_get_when_task_exists_then_round_trips_the_model", async () => {
+    const task = await store.get("homemux-h7");
+    expect(task).not.toBeNull();
+    expect(task?.title).toBe("Wire the homemux pane");
+    expect(task?.kind).toBe("ship");
+    expect(task?.repo).toBe("firstmate");
+    expect(task?.body).toBe("First line\nSecond line");
+    expect(task?.priority).toBe(1);
+    expect(task?.state).toBe("queued");
+    expect(task?.created).toBe("2026-07-01");
+  });
+
+  // ---- mapping table: state ------------------------------------------------
+
+  const STATE_TO_BD: Array<[State, string]> = [
+    ["queued", "open"],
+    ["in_flight", "in_progress"],
+    ["done", "closed"],
+  ];
+
+  it.each(STATE_TO_BD)(
+    "test_transition_when_state_is_%s_then_beads_status_is_%s",
+    async (state, bdStatus) => {
+      const id = `state-${state}`;
+      await store.create({ id, title: `State probe ${state}` });
+      const task = await store.transition(id, state);
+      expect(task.state).toBe(state);
+      expect(rawShow(graph, id).status).toBe(bdStatus);
+      // And it normalizes back to the same tasks-axi state.
+      expect((await store.get(id))?.state).toBe(state);
     },
-    IT_TIMEOUT,
   );
 
-  it(
-    "treats an identical patch as a no-op",
-    async () => {
-      const result = await bl.store.update("upd-u1", {
-        title: "new title",
-        repo: "widgets",
-      });
-      expect(result.changed).toEqual([]);
-    },
-    IT_TIMEOUT,
-  );
+  it("test_list_when_blocked_status_stored_then_folds_to_queued", async () => {
+    await store.create({ id: "folded-q1", title: "Folded status probe" });
+    const set = spawnSync(
+      "bd",
+      ["-C", graph.repo, "update", "folded-q1", "--status", "blocked"],
+      { encoding: "utf8", env: BD_ENV },
+    );
+    expect(set.status).toBe(0);
+    // tasks-axi derives `blocked` from the dependency graph, so a stored
+    // Beads `blocked` must present as queued rather than inventing a state.
+    expect((await store.get("folded-q1"))?.state).toBe("queued");
+  });
 
-  it(
-    "adds body lines without duplicating them",
-    async () => {
-      const first = await bl.store.update("upd-u1", {
-        addBodyLines: ["extra line"],
-      });
-      expect(first.changed).toEqual(["body"]);
-      const second = await bl.store.update("upd-u1", {
-        addBodyLines: ["extra line"],
-      });
-      expect(second.changed).toEqual([]);
-      const task = await bl.store.get("upd-u1");
-      expect(task?.body).toBe("original body\nextra line");
-    },
-    IT_TIMEOUT,
-  );
+  // ---- mapping table: dependencies ----------------------------------------
 
-  it(
-    "archives a superseded body on --archive-body, in the file and as a bd comment",
-    async () => {
-      const result = await bl.store.update("upd-u1", {
-        body: "curated replacement",
-        archiveBody: true,
-      });
-      expect(result.changed).toContain("archive");
-      const task = await bl.store.get("upd-u1");
-      expect(task?.body).toBe("curated replacement");
-      const archive = bl.noteArchive();
-      expect(archive).toContain("## Archived 2026-07-01");
-      expect(archive).toContain("original body");
-      const shown = execFileSync("bd", ["show", "upd-u1", "--json"], {
-        cwd: bl.dir,
-        env: { ...process.env, BEADS_DIR: join(bl.dir, ".beads") },
-        timeout: 60_000,
-      }).toString("utf8");
-      const [issue] = JSON.parse(shown) as { comment_count?: number }[];
-      expect(issue.comment_count ?? 0).toBeGreaterThanOrEqual(1);
-    },
-    IT_TIMEOUT,
-  );
+  const DEP_TO_BD: Array<[DepType, string]> = [
+    ["blocked-by", "blocks"],
+    ["parent", "parent-child"],
+    ["discovered-from", "discovered-from"],
+  ];
 
-  it.skipIf(process.platform === "win32")(
-    "keeps the superseded body when its bd comment cannot be posted",
-    async () => {
-      await bl.store.create({
-        id: "upd-arch",
-        title: "archive ordering",
-        body: "body to preserve",
-      });
-      const wrapper = join(bl.dir, "bd-no-comment.cjs");
-      writeFileSync(
-        wrapper,
-        [
-          "#!/usr/bin/env node",
-          'const { spawnSync } = require("node:child_process");',
-          'if (process.argv[2] === "comment") {',
-          '  process.stderr.write("comment disabled\\n");',
-          "  process.exit(1);",
-          "}",
-          'const r = spawnSync("bd", process.argv.slice(2), { stdio: "inherit" });',
-          "process.exit(r.status ?? 1);",
-          "",
-        ].join("\n"),
-        "utf8",
+  it.each(DEP_TO_BD)(
+    "test_add_dep_when_type_is_%s_then_beads_edge_type_is_%s",
+    async (depType, bdType) => {
+      const owner = `dep-owner-${bdType}`;
+      const target = `dep-target-${bdType}`;
+      await store.create({ id: owner, title: `Owner ${bdType}` });
+      await store.create({ id: target, title: `Target ${bdType}` });
+
+      expect(await store.addDep(owner, { type: depType, id: target })).toBe(
+        true,
       );
-      chmodSync(wrapper, 0o755);
-      const flaky = new BeadsStore({
-        dir: bl.dir,
-        mirrorPath: bl.mirrorPath,
-        bin: wrapper,
-        now: () => "2026-07-01",
-      });
-      const before = bl.noteArchive();
-      await expect(
-        flaky.update("upd-arch", {
-          body: "curated replacement",
-          archiveBody: true,
-        }),
-      ).rejects.toBeInstanceOf(AxiError);
-      const fresh = new BeadsStore({
-        dir: bl.dir,
-        mirrorPath: bl.mirrorPath,
-        now: () => "2026-07-01",
-      });
-      const task = await fresh.get("upd-arch");
-      expect(task?.body).toBe("body to preserve");
-      expect(bl.noteArchive()).toBe(before);
+      const raw = rawShow(graph, owner);
+      const deps = raw.dependencies as Array<Record<string, unknown>>;
+      expect(deps).toHaveLength(1);
+      expect(deps[0].dependency_type).toBe(bdType);
+      expect(deps[0].id).toBe(target);
+
+      // The typed edge normalizes back to the tasks-axi dep type.
+      const task = await store.get(owner);
+      expect(task?.deps).toEqual([{ type: depType, id: target }]);
     },
-    IT_TIMEOUT,
   );
 
-  it.skipIf(process.platform === "win32")(
-    "surfaces a bd update that exits 0 without persisting as a structured error",
-    async () => {
-      await bl.store.create({
-        id: "upd-ver",
-        title: "read-back subject",
-        body: "unchanged body",
-      });
-      // A bd whose `update` succeeds without writing anything: the read-back
-      // must name the diverged fields instead of reporting a silent success.
-      const wrapper = join(bl.dir, "bd-noop-update.cjs");
-      writeFileSync(
-        wrapper,
-        [
-          "#!/usr/bin/env node",
-          'const { spawnSync } = require("node:child_process");',
-          'if (process.argv[2] === "update") process.exit(0);',
-          'const r = spawnSync("bd", process.argv.slice(2), { stdio: "inherit" });',
-          "process.exit(r.status ?? 1);",
-          "",
-        ].join("\n"),
-        "utf8",
-      );
-      chmodSync(wrapper, 0o755);
-      const silent = new BeadsStore({
-        dir: bl.dir,
-        mirrorPath: bl.mirrorPath,
-        bin: wrapper,
-        now: () => "2026-07-01",
-      });
-      await expect(
-        silent.update("upd-ver", { title: "renamed", body: "new body" }),
-      ).rejects.toMatchObject({
-        code: "UNKNOWN",
-        message: expect.stringMatching(
-          /bd update did not persist title, body for "upd-ver"/,
-        ),
-      });
-      await expect(
-        silent.transition("upd-ver", "in_flight"),
-      ).rejects.toMatchObject({
-        code: "UNKNOWN",
-        message: expect.stringContaining("bd transition did not persist"),
-      });
-      const task = await bl.store.get("upd-ver");
-      expect(task?.title).toBe("read-back subject");
-      expect(task?.body).toBe("unchanged body");
-      expect(task?.state).toBe("queued");
-    },
-    IT_TIMEOUT,
-  );
+  it("test_add_dep_when_already_present_then_returns_false", async () => {
+    await store.create({ id: "idem-a", title: "Idempotent owner" });
+    await store.create({ id: "idem-b", title: "Idempotent blocker" });
+    expect(
+      await store.addDep("idem-a", { type: "blocked-by", id: "idem-b" }),
+    ).toBe(true);
+    expect(
+      await store.addDep("idem-a", { type: "blocked-by", id: "idem-b" }),
+    ).toBe(false);
+  });
 
-  it(
-    "sets, renders, and clears structured holds",
-    async () => {
-      await bl.store.update("upd-u1", {
-        hold: {
-          reason: "captain decision pending",
-          kind: "captain",
-          until: "2026-08-01",
-        },
-      });
-      let task = await bl.store.get("upd-u1");
-      expect(task?.hold).toEqual({
-        reason: "captain decision pending",
-        kind: "captain",
-        until: "2026-08-01",
-      });
-      expect(bl.mirror()).toContain(
-        "(hold: captain decision pending) (hold-kind: captain) (hold-until: 2026-08-01)",
-      );
-      const cleared = await bl.store.update("upd-u1", { hold: null });
-      expect(cleared.changed).toEqual(["hold"]);
-      task = await bl.store.get("upd-u1");
-      expect(task?.hold).toBeUndefined();
-      expect(bl.mirror()).not.toContain("(hold:");
-    },
-    IT_TIMEOUT,
-  );
+  it("test_add_dep_when_reason_given_then_reason_survives_round_trip", async () => {
+    await store.create({ id: "reason-a", title: "Reason owner" });
+    await store.create({ id: "reason-b", title: "Reason blocker" });
+    await store.addDep("reason-a", {
+      type: "blocked-by",
+      id: "reason-b",
+      reason: "waits on the upstream rename",
+    });
+    // Beads' own edge carries no free-text reason, so it is mirrored in
+    // namespaced metadata and rejoined on read.
+    const task = await store.get("reason-a");
+    expect(task?.deps).toEqual([
+      {
+        type: "blocked-by",
+        id: "reason-b",
+        reason: "waits on the upstream rename",
+      },
+    ]);
+  });
 
-  it(
-    "folds added links into the title",
-    async () => {
-      const result = await bl.store.update("upd-u1", {
-        addLinks: [{ kind: "doc", url: "https://example.com/spec" }],
-      });
-      expect(result.changed).toEqual(["links"]);
-      const task = await bl.store.get("upd-u1");
-      expect(task?.title).toBe("new title https://example.com/spec");
-      expect(task?.links).toEqual([
-        { kind: "doc", url: "https://example.com/spec" },
-      ]);
-    },
-    IT_TIMEOUT,
-  );
+  it("test_remove_dep_when_edge_present_then_removes_and_reports_true", async () => {
+    await store.create({ id: "rm-a", title: "Remove owner" });
+    await store.create({ id: "rm-b", title: "Remove blocker" });
+    await store.addDep("rm-a", { type: "blocked-by", id: "rm-b" });
+    expect(
+      await store.removeDep("rm-a", { type: "blocked-by", id: "rm-b" }),
+    ).toBe(true);
+    expect((await store.get("rm-a"))?.deps).toEqual([]);
+    expect(
+      await store.removeDep("rm-a", { type: "blocked-by", id: "rm-b" }),
+    ).toBe(false);
+  });
 
-  it(
-    "round-trips meta through bd metadata",
-    async () => {
-      const result = await bl.store.update("upd-u1", {
-        meta: { home: "main", harness: "claude" },
-      });
-      expect(result.changed).toEqual(["meta"]);
-      const task = await bl.store.get("upd-u1");
-      expect(task?.meta).toEqual({ home: "main", harness: "claude" });
-    },
-    IT_TIMEOUT,
-  );
+  it("test_create_when_blocker_absent_then_refuses_before_writing", async () => {
+    await expect(
+      store.create({
+        id: "dangling-q1",
+        title: "Dangling edge",
+        deps: [{ type: "blocked-by", id: "no-such-task" }],
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    // The refusal must not leave a half-created task behind.
+    expect(await store.get("dangling-q1")).toBeNull();
+  });
 
-  it(
-    "keeps an in-flight task in flight when a hold sets or clears --until",
-    async () => {
-      await bl.store.create({
-        id: "upd-u2",
-        title: "held in flight",
-        state: "in_flight",
-      });
-      await bl.store.update("upd-u2", {
-        hold: { reason: "captain gate", until: "2026-09-01" },
-      });
-      let task = await bl.store.get("upd-u2");
-      expect(task?.state).toBe("in_flight");
-      expect(task?.hold).toEqual({
-        reason: "captain gate",
-        until: "2026-09-01",
-      });
-      const mirror = bl.mirror();
-      const inFlight = mirror.indexOf("## In flight");
-      const queued = mirror.indexOf("## Queued");
-      const line = mirror.indexOf("- [ ] upd-u2 - held in flight");
-      expect(line).toBeGreaterThan(inFlight);
-      expect(line).toBeLessThan(queued);
+  // ---- mapping table: holds ------------------------------------------------
 
-      await bl.store.update("upd-u2", { hold: null });
-      task = await bl.store.get("upd-u2");
-      expect(task?.state).toBe("in_flight");
-      expect(task?.hold).toBeUndefined();
+  it("test_update_when_hold_set_then_atomic_namespaced_metadata", async () => {
+    await store.create({ id: "hold-q1", title: "Hold probe" });
+    const result = await store.update("hold-q1", {
+      hold: { reason: "waiting on review", kind: "captain", until: "2026-12-01" },
+    });
+    expect(result.changed).toContain("hold");
+
+    // reason, kind and until land together in ONE Beads key, so a reader never
+    // observes a half-written hold.
+    expect(metadataOf(graph, "hold-q1")["axi.hold"]).toEqual({
+      reason: "waiting on review",
+      kind: "captain",
+      until: "2026-12-01",
+    });
+    expect((await store.get("hold-q1"))?.hold).toEqual({
+      reason: "waiting on review",
+      kind: "captain",
+      until: "2026-12-01",
+    });
+  });
+
+  it("test_update_when_hold_cleared_then_tombstoned_and_reads_as_absent", async () => {
+    const result = await store.update("hold-q1", { hold: null });
+    expect(result.changed).toContain("hold");
+    // bd stores an explicit JSON null rather than dropping the key, because
+    // combining --metadata with --unset-metadata is refused and the write must
+    // stay a single atomic invocation. A tombstone must read as absent.
+    expect(metadataOf(graph, "hold-q1")["axi.hold"]).toBeNull();
+    expect((await store.get("hold-q1"))?.hold).toBeUndefined();
+  });
+
+  it("test_update_when_patch_is_a_noop_then_changed_is_empty", async () => {
+    await store.create({ id: "noop-q1", title: "Noop probe", priority: 2 });
+    const result = await store.update("noop-q1", {
+      title: "Noop probe",
+      priority: 2,
+    });
+    expect(result.changed).toEqual([]);
+  });
+
+  it("test_update_when_archive_body_then_previous_body_is_recoverable", async () => {
+    await store.create({ id: "arch-q1", title: "Archive probe", body: "old" });
+    const result = await store.update("arch-q1", {
+      body: "new",
+      archiveBody: true,
+    });
+    expect(result.changed).toContain("archive");
+    expect((await store.get("arch-q1"))?.body).toBe("new");
+    // No archive FILE exists beside an authoritative graph; the superseded body
+    // is kept in metadata instead.
+    expect(metadataOf(graph, "arch-q1")["axi.body_archive"]).toEqual([
+      { archived: "2026-07-01", body: "old" },
+    ]);
+  });
+
+  // ---- mapping table: completion evidence and reopen ----------------------
+
+  it("test_transition_when_done_then_records_evidence_links_and_note", async () => {
+    await store.create({ id: "evid-q1", title: "Evidence probe" });
+    const task = await store.transition("evid-q1", "done", {
+      pr: "https://github.com/o/r/pull/7",
+      report: "data/evid-q1/report.md",
+      note: "shipped behind a flag",
+      date: "2026-07-02",
+    });
+    expect(task.closed).toBe("2026-07-02");
+    expect(task.links).toEqual([
+      { kind: "pr", url: "https://github.com/o/r/pull/7" },
+      { kind: "report", url: "data/evid-q1/report.md" },
+    ]);
+    expect(task.body).toContain("shipped behind a flag");
+    expect(rawShow(graph, "evid-q1").status).toBe("closed");
+  });
+
+  it("test_transition_when_done_repeated_then_backfills_without_restamping", async () => {
+    const again = await store.transition("evid-q1", "done", {
+      date: "2026-09-09",
+    });
+    // Idempotent completion: evidence may be backfilled, but the ORIGINAL
+    // close date must not move.
+    expect(again.closed).toBe("2026-07-02");
+  });
+
+  it("test_reopen_when_closed_then_keeps_original_completion_evidence", async () => {
+    // bd itself CLEARS closed_at and close_reason on `-s open`, so the stamp
+    // only survives because the adapter mirrors it into namespaced metadata.
+    const reopened = await store.transition("evid-q1", "queued");
+    expect(reopened.state).toBe("queued");
+    expect(reopened.closed).toBeUndefined();
+
+    // bd drops the key entirely on reopen rather than nulling it. (`jq .closed_at`
+    // cannot tell those apart, which is why this asserts on the parsed object.)
+    expect(rawShow(graph, "evid-q1")).not.toHaveProperty("closed_at");
+    expect(metadataOf(graph, "evid-q1")["axi.closed"]).toBe("2026-07-02");
+
+    // The original PR/report evidence is still attached after the reopen.
+    const task = await store.get("evid-q1");
+    expect(task?.links).toEqual([
+      { kind: "pr", url: "https://github.com/o/r/pull/7" },
+      { kind: "report", url: "data/evid-q1/report.md" },
+    ]);
+  });
+
+  // ---- list ---------------------------------------------------------------
+
+  it("test_list_when_called_then_reads_the_whole_graph_not_bd_default_page", async () => {
+    // bd's own default is --limit 50; a silent truncation would corrupt every
+    // derived ready/blocked view.
+    const { items, total } = await store.list({});
+    expect(total).toBe(items.length);
+    expect(items.length).toBeGreaterThan(0);
+    expect(items.map((task) => task.id)).toContain("homemux-h7");
+  });
+
+  it("test_list_when_filtered_by_repo_then_matches_metadata", async () => {
+    const { items } = await store.list({ repo: "firstmate" });
+    expect(items.map((task) => task.id)).toEqual(["homemux-h7"]);
+  });
+
+  it("test_list_when_limited_then_total_reports_the_unlimited_count", async () => {
+    const all = await store.list({});
+    const capped = await store.list({ limit: 1 });
+    expect(capped.items).toHaveLength(1);
+    expect(capped.total).toBe(all.total);
+  });
+
+  // ---- remove -------------------------------------------------------------
+
+  it("test_remove_when_active_dependent_exists_then_refuses", async () => {
+    await store.create({ id: "keep-blocker", title: "Still blocking" });
+    await store.create({ id: "keep-dependent", title: "Blocked work" });
+    await store.addDep("keep-dependent", {
+      type: "blocked-by",
+      id: "keep-blocker",
+    });
+
+    // `bd delete --force` would delete this and silently drop the edge, so the
+    // guard must live in the adapter.
+    await expect(store.remove("keep-blocker")).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+    expect(await store.get("keep-blocker")).not.toBeNull();
+    expect((await store.get("keep-dependent"))?.deps).toEqual([
+      { type: "blocked-by", id: "keep-blocker" },
+    ]);
+  });
+
+  it("test_remove_when_unblocked_then_deletes_from_the_graph", async () => {
+    await store.create({ id: "gone-q1", title: "Removable" });
+    const removed = await store.remove("gone-q1");
+    expect(removed.id).toBe("gone-q1");
+    expect(await store.get("gone-q1")).toBeNull();
+  });
+
+  // ---- public followups ---------------------------------------------------
+
+  const FOLLOWUP = {
+    schema_version: 1 as const,
+    revision: 1,
+    request: {
+      request_id: "req-public-demo",
+      platform: "discord" as const,
+      context_binding: { version: "ctx1" as const, value: "ctx1_opaque_demo" },
+      public_safe_summary: "Follow up when the public-safe fix ships",
+      received_at: "2026-07-13T12:00:00Z",
+      followup_expires_at: "2026-08-13T12:00:00Z",
+      reservation_expires_at: "2026-09-13T12:00:00Z",
     },
-    IT_TIMEOUT,
-  );
+    purpose: "promised-final" as const,
+    expected_final: {
+      type: "pr-merged" as const,
+      project: "demo",
+      required_deliverables: ["pr_url"],
+      completion_policy: "all-required" as const,
+    },
+    obligation_expires_at: "2026-08-13T12:00:00Z",
+    delivery: {
+      state: "intent" as const,
+      delivery_key: "fd1_demo",
+      payload_digest: null,
+      attempt_count: 0,
+      last_error_code: null,
+      next_attempt_at: null,
+      receipt: null,
+      last_error: null,
+      waiver: null,
+    },
+    work_relations: [],
+    lineage: {
+      predecessor_obligation_id: null,
+      successor_obligation_id: null,
+    },
+  };
+
+  it("test_create_when_public_followup_then_typed_payload_round_trips", async () => {
+    const task = await store.create({
+      id: "public-final-ab",
+      title: FOLLOWUP.request.public_safe_summary,
+      kind: "public-followup",
+      public_followup: FOLLOWUP,
+    });
+    expect(task.public_followup?.revision).toBe(1);
+
+    // The obligation is stored as one atomic encoded value, not lossy prose.
+    expect(typeof metadataOf(graph, "public-final-ab")["axi.public_followup"]).toBe(
+      "string",
+    );
+    const reread = await store.get("public-final-ab");
+    expect(reread?.public_followup).toEqual(task.public_followup);
+  });
+
+  it("test_transition_when_public_followup_then_refuses_generic_state_change", async () => {
+    await expect(
+      store.transition("public-final-ab", "done"),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  it("test_update_public_followup_when_revision_is_stale_then_conflict", async () => {
+    await expect(
+      store.updatePublicFollowup("public-final-ab", {
+        expectedRevision: 7,
+        expectedPublicFollowup: { ...FOLLOWUP, revision: 7 },
+        publicFollowup: { ...FOLLOWUP, revision: 8 },
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("test_update_public_followup_when_not_an_obligation_then_validation_error", async () => {
+    await expect(
+      store.updatePublicFollowup("homemux-h7", {
+        expectedRevision: 1,
+        expectedPublicFollowup: FOLLOWUP,
+        publicFollowup: { ...FOLLOWUP, revision: 2 },
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  // ---- negative arms ------------------------------------------------------
+
+  it("test_get_when_id_absent_then_returns_null", async () => {
+    expect(await store.get("no-such-task-at-all")).toBeNull();
+  });
+
+  it("test_update_when_id_absent_then_not_found_error", async () => {
+    await expect(
+      store.update("no-such-task-at-all", { title: "x" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("test_remove_when_id_absent_then_not_found_error", async () => {
+    await expect(store.remove("no-such-task-at-all")).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+  });
+
+  it("test_transition_when_id_absent_then_not_found_error", async () => {
+    await expect(
+      store.transition("no-such-task-at-all", "done"),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("test_add_dep_when_owner_absent_then_not_found_error", async () => {
+    await expect(
+      store.addDep("no-such-task-at-all", {
+        type: "blocked-by",
+        id: "homemux-h7",
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("test_create_when_id_already_exists_then_conflict", async () => {
+    await expect(
+      store.create({ id: "homemux-h7", title: "Duplicate" }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("test_prefix_fallback_when_bare_id_missing_then_resolves_prefixed_id", async () => {
+    const prefixed = new BeadsStore({
+      path: graph.beadsDir,
+      binary: "bd",
+      prefix: "SPIKE",
+      now: () => "2026-07-01",
+    });
+    await prefixed.create({ id: "SPIKE-legacy1", title: "Prefixed task" });
+    // Firstmate expects prefix fallback for a legacy markdown id.
+    expect((await prefixed.get("legacy1"))?.id).toBe("SPIKE-legacy1");
+    // A literal hit still wins, so a bare id is never shadowed.
+    expect(await prefixed.get("no-such-task-at-all")).toBeNull();
+  });
 });
 
-describe.skipIf(!BD_AVAILABLE)("BeadsStore transitions and deps", () => {
-  let bl: TempBeadsBacklog;
-  beforeAll(async () => {
-    bl = makeBeadsBacklog();
-    await bl.store.create({ id: "flow-f1", title: "the work", created: null });
-    await bl.store.create({ id: "flow-f2", title: "the blocker" });
-  }, HOOK_TIMEOUT);
-  afterAll(() => bl.cleanup());
+describe("BeadsStore graph resolution", () => {
+  it("test_mutation_when_graph_path_unresolvable_then_refuses_without_markdown_fallback", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tasks-axi-nograph-"));
+    const store = new BeadsStore({ path: join(dir, "absent", ".beads") });
 
-  it(
-    "start backfills the created date",
-    async () => {
-      const task = await bl.store.transition("flow-f1", "in_flight");
-      expect(task.state).toBe("in_flight");
-      expect(task.created).toBe("2026-07-01");
-      expect((await bl.store.get("flow-f1"))?.state).toBe("in_flight");
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "done records the pr link and closed date",
-    async () => {
-      const task = await bl.store.transition("flow-f1", "done", {
-        pr: "https://github.com/owner/repo/pull/42",
-        note: "landed cleanly",
-      });
-      expect(task.state).toBe("done");
-      expect(task.closed).toBe("2026-07-01");
-      expect(task.links).toEqual([
-        { kind: "pr", url: "https://github.com/owner/repo/pull/42" },
-      ]);
-      expect(task.body).toBe("landed cleanly");
-      expect(bl.mirror()).toContain(
-        "- [x] flow-f1 - the work https://github.com/owner/repo/pull/42 (merged 2026-07-01)",
-      );
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "reopen clears the closed date",
-    async () => {
-      const task = await bl.store.transition("flow-f1", "queued");
-      expect(task.state).toBe("queued");
-      expect(task.closed).toBeUndefined();
-      expect((await bl.store.get("flow-f1"))?.closed).toBeUndefined();
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "addDep and removeDep are idempotent with reasons preserved",
-    async () => {
-      const added = await bl.store.addDep("flow-f1", {
-        type: "blocked-by",
-        id: "flow-f2",
-        reason: "waits on the blocker",
-      });
-      expect(added).toBe(true);
-      const again = await bl.store.addDep("flow-f1", {
-        type: "blocked-by",
-        id: "flow-f2",
-      });
-      expect(again).toBe(false);
-      let task = await bl.store.get("flow-f1");
-      expect(task?.deps).toEqual([
-        { type: "blocked-by", id: "flow-f2", reason: "waits on the blocker" },
-      ]);
-      await expect(
-        bl.store.addDep("flow-f1", { type: "blocked-by", id: "missing-m9" }),
-      ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
-
-      const removed = await bl.store.removeDep("flow-f1", {
-        type: "blocked-by",
-        id: "flow-f2",
-      });
-      expect(removed).toBe(true);
-      const removedAgain = await bl.store.removeDep("flow-f1", {
-        type: "blocked-by",
-        id: "flow-f2",
-      });
-      expect(removedAgain).toBe(false);
-      task = await bl.store.get("flow-f1");
-      expect(task?.deps).toEqual([]);
-    },
-    IT_TIMEOUT,
-  );
-
-  it(
-    "refuses a second relationship type to the same task pair",
-    async () => {
-      await bl.store.create({ id: "flow-f3", title: "shared target" });
-      await bl.store.addDep("flow-f1", { type: "parent", id: "flow-f3" });
-      await expect(
-        bl.store.addDep("flow-f1", { type: "blocked-by", id: "flow-f3" }),
-      ).rejects.toMatchObject({
-        code: "VALIDATION_ERROR",
-        message: expect.stringContaining("parent edge"),
-      });
-      let task = await bl.store.get("flow-f1");
-      expect(task?.deps).toEqual([{ type: "parent", id: "flow-f3" }]);
-      const removed = await bl.store.removeDep("flow-f1", {
-        type: "parent",
-        id: "flow-f3",
-      });
-      expect(removed).toBe(true);
-      task = await bl.store.get("flow-f1");
-      expect(task?.deps).toEqual([]);
-    },
-    IT_TIMEOUT,
-  );
-});
-
-describe.skipIf(!BD_AVAILABLE)("BeadsStore maintenance and mirror", () => {
-  let bl: TempBeadsBacklog;
-  beforeAll(async () => {
-    bl = makeBeadsBacklog();
-    for (const [id, closed] of [
-      ["old-o1", "2026-06-01"],
-      ["old-o2", "2026-06-02"],
-      ["old-o3", "2026-06-03"],
-    ] as const) {
-      await bl.store.create({ id, title: `finished ${id}`, created: null });
-      await bl.store.transition(id, "done", { date: closed });
+    let error: unknown;
+    try {
+      await store.create({ id: "refused-q1", title: "Refused" });
+    } catch (caught) {
+      error = caught;
     }
-    await bl.store.create({ id: "live-l1", title: "still queued" });
-  }, HOOK_TIMEOUT);
-  afterAll(() => bl.cleanup());
+    expect(error).toBeInstanceOf(AxiError);
+    expect((error as AxiError).code).toBe("VALIDATION_ERROR");
+    expect((error as Error).message).toContain("Beads graph not found");
 
-  it(
-    "prune keeps the newest done tasks and archives the surplus",
-    async () => {
-      const result = await bl.store.prune({
-        state: "done",
-        keep: 1,
-        archive: true,
-      });
-      expect(result.archived).toBe(2);
-      expect(result.ids.sort()).toEqual(["old-o1", "old-o2"]);
-      const { items } = await bl.store.list({ state: "done" });
-      expect(items.map((t) => t.id)).toEqual(["old-o3"]);
-      expect(await bl.store.get("old-o1")).toBeNull();
-      const archive = bl.archive();
-      expect(archive).toContain("## Archived 2026-07-01");
-      expect(archive).toContain(
-        "- [x] old-o1 - finished old-o1 (done 2026-06-01)",
-      );
-      expect(archive).toContain(
-        "- [x] old-o2 - finished old-o2 (done 2026-06-02)",
-      );
-      expect(bl.mirror()).not.toContain("old-o1");
-    },
-    IT_TIMEOUT,
-  );
+    // The refusal must not degrade into writing a markdown backlog anywhere.
+    expect(readdirSync(dir)).toEqual([]);
+    expect(existsSync(join(dir, "backlog.md"))).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
 
-  it(
-    "render rewrites the mirror and reports the task count",
-    async () => {
-      const count = await bl.store.render();
-      expect(count).toBe(2);
-    },
-    IT_TIMEOUT,
-  );
+  it("test_reads_when_graph_path_unresolvable_then_also_refuse", async () => {
+    const store = new BeadsStore({ path: "/nonexistent/spike/.beads" });
+    await expect(store.get("anything")).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+    await expect(store.list({})).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+  });
 
-  it(
-    "the mirror parses back into the same tasks",
-    async () => {
-      const doc = parseBacklog(bl.mirror());
-      const parsed = doc.sections.flatMap((section) =>
-        section.entries.flatMap((entry) =>
-          entry.kind === "task" ? [entry.task] : [],
-        ),
-      );
-      const { items } = await bl.store.list({});
-      expect(parsed.map((t) => [t.id, t.state, t.title])).toEqual(
-        items.map((t) => [t.id, t.state, t.title]),
-      );
-    },
-    IT_TIMEOUT,
-  );
+  it("test_run_when_bd_binary_missing_then_unsupported_naming_the_binary", async () => {
+    const graphDir = mkdtempSync(join(tmpdir(), "tasks-axi-nobin-"));
+    const store = new BeadsStore({
+      path: graphDir,
+      binary: "bd-does-not-exist-anywhere",
+    });
+    await expect(store.get("anything")).rejects.toMatchObject({
+      code: "UNSUPPORTED",
+    });
+    rmSync(graphDir, { recursive: true, force: true });
+  });
+});
 
-  it(
-    "reports a missing database as an actionable error",
-    async () => {
-      const dir = mkdtempSync(join(tmpdir(), "tasks-axi-nodb-"));
-      try {
-        const store = new BeadsStore({
-          dir,
-          mirrorPath: join(dir, "backlog.md"),
-        });
-        await expect(store.list({})).rejects.toSatisfy((error: unknown) => {
-          const axi = error as AxiError;
-          return (
-            axi.code === "VALIDATION_ERROR" &&
-            /no beads database found/.test(axi.message)
-          );
-        });
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    },
-    IT_TIMEOUT,
-  );
+describe("beads configuration", () => {
+  it("test_parse_toml_when_beads_table_then_path_binary_and_prefix_read", () => {
+    const parsed = parseConfigToml(
+      [
+        'backend = "beads"',
+        "",
+        "[beads]",
+        'path = "/repo/.beads"',
+        'binary = "/usr/local/bin/bd"',
+        'prefix = "aih"',
+      ].join("\n"),
+    );
+    expect(parsed.backend).toBe("beads");
+    expect(parsed.beads).toEqual({
+      path: "/repo/.beads",
+      binary: "/usr/local/bin/bd",
+      prefix: "aih",
+    });
+  });
+
+  it("test_resolve_config_when_env_selects_beads_then_backend_is_beads", () => {
+    const resolved = resolveConfig({
+      cwd: "/tmp",
+      home: "/tmp",
+      env: { TASKS_AXI_BACKEND: "beads" },
+    });
+    expect(resolved.backend).toBe("beads");
+    // A graph path is always resolved, defaulting beside the working root.
+    expect(resolved.beads.path).toBe("/tmp/.beads");
+    expect(resolved.beads.binary).toBe("bd");
+  });
+
+  it("test_resolve_context_when_backend_is_beads_then_builds_a_beads_store", () => {
+    const ctx = resolveTasksContext({
+      cwd: "/tmp",
+      home: "/tmp",
+      env: { TASKS_AXI_BACKEND: "beads" },
+    });
+    expect(ctx.store).toBeInstanceOf(BeadsStore);
+    expect(ctx.store.capabilities().backend).toBe("beads");
+  });
+
+  it("test_resolve_context_when_backend_is_unknown_then_still_unsupported", () => {
+    expect(() =>
+      resolveTasksContext({
+        cwd: "/tmp",
+        home: "/tmp",
+        env: { TASKS_AXI_BACKEND: "sqlite" },
+      }),
+    ).toThrowError(/Unsupported backend "sqlite"/);
+  });
+});
+
+/**
+ * `mv` across two graphs. These exercise the command layer, not just the store,
+ * because what `--to` DENOTES is a command-layer decision: for a beads home it
+ * names another `.beads` graph, and crossing record types is refused by name
+ * rather than exported.
+ */
+describe.skipIf(!BD_AVAILABLE)("BeadsStore cross-graph mv", () => {
+  const graphs: Graph[] = [];
+
+  function freshGraph(): Graph {
+    const graph = makeGraph();
+    graphs.push(graph);
+    return graph;
+  }
+
+  function contextFor(graph: Graph): TasksContext {
+    const config: ResolvedConfig = {
+      backend: "beads",
+      // Present but deliberately unused: a beads home is addressed by its
+      // graph alone, and this file must never be created.
+      path: join(graph.repo, "data", "backlog.md"),
+      doneKeep: 10,
+      beads: { path: graph.beadsDir, binary: "bd" },
+    };
+    return {
+      store: new BeadsStore({
+        path: graph.beadsDir,
+        binary: "bd",
+        now: () => "2026-07-01",
+      }),
+      config,
+    };
+  }
+
+  afterAll(() => {
+    for (const graph of graphs) {
+      rmSync(graph.repo, { recursive: true, force: true });
+    }
+  });
+
+  it("test_mv_when_connected_set_moves_between_graphs_then_only_destination_holds_them", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+
+    await ctx.store.create({ id: "mv-blocker", title: "Lay the cable" });
+    await ctx.store.create({
+      id: "mv-dependent",
+      title: "Light the lamp",
+      deps: [{ type: "blocked-by", id: "mv-blocker", reason: "needs power" }],
+    });
+
+    const out = await mvCommand(
+      ["mv-blocker", "mv-dependent", "--to", destination.repo],
+      ctx,
+    );
+    expect(out).toContain("mv mv-blocker mv-dependent ->");
+
+    // Gone from the source, present in the destination — with the edge and its
+    // reason string carried across.
+    expect(await ctx.store.get("mv-blocker")).toBeNull();
+    expect(await ctx.store.get("mv-dependent")).toBeNull();
+
+    const landed = contextFor(destination).store;
+    expect((await landed.get("mv-blocker"))?.title).toBe("Lay the cable");
+    const dependent = await landed.get("mv-dependent");
+    expect(dependent?.deps).toEqual([
+      { type: "blocked-by", id: "mv-blocker", reason: "needs power" },
+    ]);
+  });
+
+  it("test_mv_when_destination_is_a_markdown_backlog_then_refuses_and_leaves_the_source_intact", async () => {
+    const ctx = contextFor(freshGraph());
+    await ctx.store.create({ id: "mv-stay", title: "Stay put" });
+
+    const target = join(
+      mkdtempSync(join(tmpdir(), "tasks-axi-md-")),
+      "backlog.md",
+    );
+    await expect(mvCommand(["mv-stay", "--to", target], ctx)).rejects.toThrow(
+      /cannot move tasks into/,
+    );
+
+    // No export happened: the row is still in the graph and no file was written.
+    expect((await ctx.store.get("mv-stay"))?.title).toBe("Stay put");
+    expect(existsSync(target)).toBe(false);
+    expect(existsSync(ctx.config.path)).toBe(false);
+  });
+
+  it("test_mv_when_destination_graph_is_absent_then_refuses_without_a_markdown_fallback", async () => {
+    const ctx = contextFor(freshGraph());
+    await ctx.store.create({ id: "mv-nograph", title: "No graph there" });
+
+    const bare = mkdtempSync(join(tmpdir(), "tasks-axi-bare-"));
+    await expect(mvCommand(["mv-nograph", "--to", bare], ctx)).rejects.toThrow(
+      /does not name a beads graph/,
+    );
+    expect((await ctx.store.get("mv-nograph"))?.title).toBe("No graph there");
+    expect(readdirSync(bare)).toEqual([]);
+  });
+
+  it("test_transfer_many_when_destination_is_not_a_graph_then_names_the_backend", async () => {
+    const store = contextFor(freshGraph()).store as BeadsStore;
+    await store.create({ id: "mv-direct", title: "Direct call" });
+
+    const notAGraph = new MarkdownStore({
+      path: join(mkdtempSync(join(tmpdir(), "tasks-axi-md-")), "backlog.md"),
+    });
+    await expect(store.transferMany(["mv-direct"], notAGraph)).rejects.toThrow(
+      /can only transfer tasks into another beads graph, not "markdown"/,
+    );
+    expect((await store.get("mv-direct"))?.title).toBe("Direct call");
+  });
 });
