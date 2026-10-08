@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0](https://github.com/sergeiwallace/tasks-axi/compare/tasks-axi-v0.2.6...tasks-axi-v0.3.0) (2026-10-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **beads:** make the Beads graph the sole record
+
+### Features
+
+* **beads:** make the Beads graph the sole record ([88e9464](https://github.com/sergeiwallace/tasks-axi/commit/88e946486e99a70190a27cb8e5278cf1dfbdde67))
+* **beads:** restore PR [#52](https://github.com/sergeiwallace/tasks-axi/issues/52)'s dep-pair conflict refusal ([d191e38](https://github.com/sergeiwallace/tasks-axi/commit/d191e38ab64d6d5fa78c1569c5cbac0f24e7a4bb))
+
+
+### Bug Fixes
+
+* **beads:** serialize every graph mutation behind an advisory lock ([31aa84a](https://github.com/sergeiwallace/tasks-axi/commit/31aa84ab32443dd2c3443bf294dec93d9044b5b5))
+* **mv:** capture the failing removal's detail before the rollback runs ([ffbc57c](https://github.com/sergeiwallace/tasks-axi/commit/ffbc57c13e42ec8aa499150dbba75a90c09a05ac))
+* **mv:** make the beads transfer contract honest and recoverable ([deee55b](https://github.com/sergeiwallace/tasks-axi/commit/deee55bdacb6c4504f96f8314d053f9bd144052c))
+* **mv:** never let a transfer rollback strip a moved dependent's edge ([38a3121](https://github.com/sergeiwallace/tasks-axi/commit/38a3121da66717a57303ffdc8ffb772007aae999))
+* **mv:** protect every represented edge type during transfer and rollback ([fdf2dea](https://github.com/sergeiwallace/tasks-axi/commit/fdf2dea793d9080885f82fd5a86b2116131f4777))
+* **mv:** refuse a destination dir that HOLDS a beads graph, not just one named .beads ([8e2e09a](https://github.com/sergeiwallace/tasks-axi/commit/8e2e09a03ba861c8d2e28c0aaea7076cffac4811))
+* **mv:** refuse to transfer a public obligation between beads graphs ([0b29557](https://github.com/sergeiwallace/tasks-axi/commit/0b295576637c1916bf09832402805924d0d1d5f9))
+
 ## [0.2.6](https://github.com/kunchenguid/tasks-axi/compare/tasks-axi-v0.2.5...tasks-axi-v0.2.6) (2026-09-22)
 
 
