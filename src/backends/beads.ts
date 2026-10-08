@@ -1224,7 +1224,10 @@ export class BeadsStore implements Store {
    * adapter must never do.
    *
    * Two Dolt graphs cannot share one transaction, so this is NOT literally
-   * atomic and does not claim to be. It is ordered and recoverable:
+   * atomic and does not claim to be. A set carrying a public obligation is
+   * therefore refused outright (`requireNoPublicObligation`): recoverable is
+   * not good enough for a record that must exist exactly once. Everything else
+   * is ordered and recoverable:
    *
    *  1. Every destination row is staged first. Any refusal or error in that
    *     phase rolls the whole staging back, leaving the SOURCE untouched.
@@ -1254,6 +1257,7 @@ export class BeadsStore implements Store {
       tasks.push(this.toTask(record));
     }
     const moved = new Set(tasks.map((task) => task.id));
+    this.requireNoPublicObligation(tasks, destination.beadsDir);
 
     for (const id of uniqueIds) {
       if (await destination.get(id)) {
@@ -1349,6 +1353,37 @@ export class BeadsStore implements Store {
         ? "bd delete exited 0 but the row is still in the graph"
         : `bd delete exited ${result.status}`);
     return false;
+  }
+
+  /**
+   * A public obligation is an outward-facing promise, so exactly one record of
+   * it may exist. This transfer is compensating, not transactional: a source
+   * removal can fail after another row has already left, and a rollback can be
+   * refused, either of which leaves the obligation in BOTH graphs — two records
+   * of one promise, each with its own delivery state and revision, which no
+   * compensation can reconcile afterwards.
+   *
+   * So a set carrying one is refused HERE, before anything is written, in the
+   * same terms the command layer's non-atomic fallback already uses: the
+   * refusal follows from the transfer mechanism, not from the delivery state,
+   * and closing the obligation out does not lift it — a posted receipt is still
+   * the proof of a public post, and duplicating that proof is the same fault.
+   * Recreating the obligation in the destination deliberately is the safe
+   * route, because it mints a new identity rather than copying one.
+   */
+  private requireNoPublicObligation(tasks: Task[], destination: string): void {
+    const carriers = tasks
+      .filter((task) => isPublicFollowupTask(task) || task.public_followup)
+      .map((task) => task.id);
+    if (carriers.length === 0) return;
+    throw new AxiError(
+      `Cannot transfer ${carriers.join(", ")} into ${destination}: a public obligation cannot be moved between beads graphs, because the transfer is compensating rather than atomic and an interrupted move would leave the obligation in both graphs. The refusal follows from the transfer, not from the delivery state`,
+      "VALIDATION_ERROR",
+      [
+        `Move the rest of the set and leave ${carriers.join(", ")} where they are`,
+        `Or recreate the obligation in the destination deliberately (\`tasks-axi public-followup add --help\`) and close the original`,
+      ],
+    );
   }
 
   /**

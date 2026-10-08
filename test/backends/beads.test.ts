@@ -1027,6 +1027,51 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore cross-graph mv", () => {
   });
 
   /**
+   * A public obligation must exist exactly once, and this transfer is
+   * compensating rather than atomic: an interrupted move can leave a row in
+   * both graphs. So the set is refused before any write. The control for this
+   * case is
+   * `test_mv_when_connected_set_moves_between_graphs_then_only_destination_holds_them`
+   * above: a set WITHOUT an obligation still transfers.
+   */
+  it("test_mv_when_the_set_carries_a_public_obligation_then_refuses_before_any_write", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+
+    await ctx.store.create({ id: "ob-plain", title: "Ordinary chore" });
+    await ctx.store.create({
+      id: "ob-promise",
+      title: FOLLOWUP.request.public_safe_summary,
+      kind: "public-followup",
+      public_followup: FOLLOWUP,
+    });
+
+    let error: unknown;
+    try {
+      await mvCommand(
+        ["ob-plain", "ob-promise", "--to", destination.repo],
+        ctx,
+      );
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect((error as AxiError).code).toBe("VALIDATION_ERROR");
+    expect((error as Error).message).toContain("ob-promise");
+    expect((error as Error).message).toContain("public obligation");
+
+    // Nothing was written on EITHER side — not the obligation, and not the
+    // ordinary task that shared the set with it.
+    expect(rawExists(destination, "ob-promise")).toBe(false);
+    expect(rawExists(destination, "ob-plain")).toBe(false);
+    expect((await ctx.store.get("ob-promise"))?.public_followup?.revision).toBe(
+      1,
+    );
+    expect((await ctx.store.get("ob-plain"))?.title).toBe("Ordinary chore");
+  });
+
+  /**
    * Failure injection. Two graphs cannot share a transaction, so what the
    * contract actually promises is recoverability: the transfer stops at the
    * first failed source removal, each id ends up in exactly one graph wherever
