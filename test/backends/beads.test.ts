@@ -38,8 +38,11 @@ import { bdAvailability } from "../beads-helpers.js";
  */
 
 // Each case drives several real `bd` invocations against an embedded Dolt
-// store; the 5s default is a harness limit, not a contract.
-vi.setConfig({ testTimeout: 60_000, hookTimeout: 180_000 });
+// store; the 5s default is a harness limit, not a contract. So is this one: the
+// cross-graph cases each `bd init` two graphs, and the slowest of them measured
+// 33s with this file running alone and timed out at the previous 60s under the
+// whole suite's parallelism on a loaded host.
+vi.setConfig({ testTimeout: 180_000, hookTimeout: 180_000 });
 
 const BD_ENV = {
   ...process.env,
