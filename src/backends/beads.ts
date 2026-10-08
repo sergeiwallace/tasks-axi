@@ -1,6 +1,7 @@
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { dirname } from "node:path";
+import { promisify } from "node:util";
 import { AxiError } from "../errors.js";
 import { validateDependencyId, validateId } from "../id.js";
 import type {
@@ -66,19 +67,6 @@ const META_FOLLOWUP = "axi.public_followup";
 const META_BODY_ARCHIVE = "axi.body_archive";
 const META_BAG = "axi.meta";
 
-/** Every key this adapter owns; anything else in `metadata` is left untouched. */
-const OWNED_META_KEYS = [
-  META_KIND,
-  META_REPO,
-  META_HOLD,
-  META_CREATED,
-  META_CLOSED,
-  META_DEP_REASONS,
-  META_FOLLOWUP,
-  META_BODY_ARCHIVE,
-  META_BAG,
-];
-
 const STATE_TO_BD: Record<State, string> = {
   queued: "open",
   in_flight: "in_progress",
@@ -130,7 +118,19 @@ export interface BeadsRunResult {
 }
 
 /** Boundary: run one `bd` invocation. Injected in tests. */
-export type BeadsRunner = (args: string[]) => BeadsRunResult;
+export type BeadsRunner = (args: string[]) => Promise<BeadsRunResult>;
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * A `dependencies` payload nests a full issue record per edge, so a heavily
+ * linked graph produces a large read. 64 MiB is far above any realistic
+ * backlog while still bounding a runaway response.
+ */
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+/** Bound a hung bd call rather than blocking a lifecycle operation forever. */
+const BD_TIMEOUT_MS = 120_000;
 
 export interface BeadsStoreOptions {
   /** The `.beads` directory of the owning repository. */
@@ -441,35 +441,56 @@ export class BeadsStore implements Store {
     }
   }
 
-  private run(args: string[]): BeadsRunResult {
+  private async run(args: string[]): Promise<BeadsRunResult> {
     this.requireGraph();
     if (this.runner) return this.runner(args);
     // `-C` selects the repository root that owns the `.beads` directory; it is
     // bd's documented `git -C` equivalent and works from any cwd.
     const full = ["-C", dirname(this.beadsDir), ...args];
-    const result = spawnSync(this.binary, full, {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        // bd otherwise stages its own export during a write, which can orphan
-        // .git/index.lock, and adopts a Dolt remote from git origin on push.
-        BD_EXPORT_GIT_ADD: "false",
-        BD_NO_REMOTE_ADOPT: "1",
-        BD_NO_DEP_TYPE_WARNING: "1",
-      },
-    });
-    if (result.error) {
-      throw new AxiError(
-        `Could not run ${this.binary}: ${result.error.message}`,
-        "UNSUPPORTED",
-        [`Install bd, or set \`[beads] binary = "<path>"\` in .tasks.toml`],
-      );
+    try {
+      const { stdout, stderr } = await execFileAsync(this.binary, full, {
+        encoding: "utf8",
+        maxBuffer: MAX_OUTPUT_BYTES,
+        timeout: BD_TIMEOUT_MS,
+        env: {
+          ...process.env,
+          // bd otherwise stages its own export during a write, which can
+          // orphan .git/index.lock, and adopts a Dolt remote from git origin.
+          BD_EXPORT_GIT_ADD: "false",
+          BD_NO_REMOTE_ADOPT: "1",
+          BD_NO_DEP_TYPE_WARNING: "1",
+        },
+      });
+      return { status: 0, stdout, stderr };
+    } catch (error) {
+      const failure = error as NodeJS.ErrnoException & {
+        code?: number | string;
+        stdout?: string;
+        stderr?: string;
+        killed?: boolean;
+      };
+      // A missing binary (or a spawn failure) is a configuration fault, not a
+      // bd-reported error: there is no exit status to interpret.
+      if (typeof failure.code === "string" || failure.stdout === undefined) {
+        throw new AxiError(
+          `Could not run ${this.binary}: ${failure.message}`,
+          "UNSUPPORTED",
+          [`Install bd, or set \`[beads] binary = "<path>"\` in .tasks.toml`],
+        );
+      }
+      if (failure.killed) {
+        throw new AxiError(
+          `bd timed out after ${BD_TIMEOUT_MS}ms`,
+          "UNKNOWN",
+          ["Retry, or check for a stuck Dolt lock on the graph"],
+        );
+      }
+      return {
+        status: typeof failure.code === "number" ? failure.code : 1,
+        stdout: failure.stdout ?? "",
+        stderr: failure.stderr ?? "",
+      };
     }
-    return {
-      status: result.status ?? 1,
-      stdout: result.stdout ?? "",
-      stderr: result.stderr ?? "",
-    };
   }
 
   private mentionsNotFound(result: BeadsRunResult): boolean {
@@ -485,9 +506,9 @@ export class BeadsStore implements Store {
     );
   }
 
-  /** Run a read and return the issue records, or null when the id is absent. */
-  private showRaw(id: string): BeadsRecord | null {
-    const result = this.run(["show", id, "--json"]);
+  /** Run a read and return the issue record, or null when the id is absent. */
+  private async showRaw(id: string): Promise<BeadsRecord | null> {
+    const result = await this.run(["show", id, "--json"]);
     if (result.status !== 0) {
       if (this.mentionsNotFound(result)) return null;
       this.fail(`show ${id}`, result);
@@ -514,8 +535,8 @@ export class BeadsStore implements Store {
    * A literal hit always wins, so a prefixed graph can still hold a legacy
    * markdown id verbatim.
    */
-  private resolve(id: string): BeadsRecord | null {
-    const direct = this.showRaw(id);
+  private async resolve(id: string): Promise<BeadsRecord | null> {
+    const direct = await this.showRaw(id);
     if (direct) return direct;
     if (!this.prefix || id.startsWith(`${this.prefix}-`)) return null;
     return this.showRaw(`${this.prefix}-${id}`);
@@ -584,9 +605,13 @@ export class BeadsStore implements Store {
     return task;
   }
 
-  /** The owned-key patch for one write, merged by bd into existing metadata. */
+  /**
+   * The owned-key patch for one write, merged by bd into existing metadata.
+   * `extra` is applied LAST so a caller can override an owned key — the
+   * completion stamp relies on that to survive a reopen.
+   */
   private metaPatch(task: Task, extra: Record<string, unknown> = {}): string {
-    const patch: Record<string, unknown> = { ...extra };
+    const patch: Record<string, unknown> = {};
     patch[META_KIND] = task.kind ?? null;
     patch[META_REPO] = task.repo ?? null;
     patch[META_HOLD] = task.hold ?? null;
@@ -602,29 +627,27 @@ export class BeadsStore implements Store {
     }
     patch[META_DEP_REASONS] =
       Object.keys(reasons).length > 0 ? reasons : null;
-    return JSON.stringify(patch);
+    return JSON.stringify({ ...patch, ...extra });
   }
 
   /**
-   * `--metadata` merges and cannot delete, so a key whose value is now absent
-   * is unset explicitly. Returns the flags for one `bd` write.
+   * The `--metadata` flags for ONE `bd` write.
+   *
+   * Every owned key is always sent, and a key whose value is now absent is
+   * sent as an explicit JSON `null`. Two measured bd 1.3.0 constraints force
+   * that shape rather than `--unset-metadata`:
+   *   - `bd create` has no `--unset-metadata` at all (it is `bd update`'s).
+   *   - `bd update` REFUSES to combine `--metadata` with `--unset-metadata`
+   *     ("cannot combine ..."), so clearing one key while setting another
+   *     would take two invocations — and a hold or a public-followup
+   *     completion must not be observable half-written.
+   *
+   * The cost is a tombstone: the key survives holding `null` instead of
+   * disappearing. Readers treat a null as absent, so the Task model is
+   * unaffected.
    */
   private metaFlags(task: Task, extra: Record<string, unknown> = {}): string[] {
-    const encoded = this.metaPatch(task, extra);
-    const parsed = JSON.parse(encoded) as Record<string, unknown>;
-    const present: Record<string, unknown> = {};
-    const flags: string[] = [];
-    for (const [key, value] of Object.entries(parsed)) {
-      if (value === null) {
-        if (OWNED_META_KEYS.includes(key)) flags.push("--unset-metadata", key);
-        continue;
-      }
-      present[key] = value;
-    }
-    if (Object.keys(present).length > 0) {
-      flags.unshift("--metadata", JSON.stringify(present));
-    }
-    return flags;
+    return ["--metadata", this.metaPatch(task, extra)];
   }
 
   // -------------------------------------------------------------------------
@@ -632,7 +655,7 @@ export class BeadsStore implements Store {
   // -------------------------------------------------------------------------
 
   async get(id: string): Promise<Task | null> {
-    const record = this.resolve(id);
+    const record = await this.resolve(id);
     return record ? this.toTask(record) : null;
   }
 
@@ -641,7 +664,7 @@ export class BeadsStore implements Store {
     // backlog, and tasks-axi derives ready/blocked/held from the whole set.
     const args = ["list", "--json", "--limit", "0"];
     if (query.state) args.push("--status", STATE_TO_BD[query.state]);
-    const result = this.run(args);
+    const result = await this.run(args);
     if (result.status !== 0) this.fail("list", result);
     let parsed: unknown;
     try {
@@ -733,12 +756,12 @@ export class BeadsStore implements Store {
 
   async create(input: TaskInput): Promise<Task> {
     const task = this.taskFromInput(input);
-    if (this.resolve(task.id)) {
+    if (await this.resolve(task.id)) {
       throw new AxiError(`Task "${task.id}" already exists`, "CONFLICT");
     }
     // Mirrors the markdown backend: a dangling edge is refused before any write.
     for (const dep of task.deps) {
-      if (this.resolve(dep.id)) continue;
+      if (await this.resolve(dep.id)) continue;
       const label = dep.type === "blocked-by" ? "blocker" : "dependency";
       throw new AxiError(`${label} "${dep.id}" not found`, "VALIDATION_ERROR", [
         "Create the dependency task first, or choose an existing task id",
@@ -764,17 +787,17 @@ export class BeadsStore implements Store {
     if (task.body !== undefined) args.push("--description", task.body);
     args.push(...this.metaFlags(task));
 
-    const result = this.run(args);
+    const result = await this.run(args);
     if (result.status !== 0) this.fail(`create ${task.id}`, result);
 
     for (const dep of task.deps) {
-      this.writeDep(task.id, dep);
+      await this.writeDep(task.id, dep);
     }
     return task;
   }
 
   async update(id: string, patch: TaskPatch): Promise<TaskUpdateResult> {
-    const record = this.resolve(id);
+    const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
 
@@ -903,13 +926,13 @@ export class BeadsStore implements Store {
     }
     args.push(...this.metaFlags(task, extra));
 
-    const result = this.run(args);
+    const result = await this.run(args);
     if (result.status !== 0) this.fail(`update ${record.id}`, result);
     return { task, changed };
   }
 
   async remove(id: string): Promise<Task> {
-    const record = this.resolve(id);
+    const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
 
@@ -941,7 +964,7 @@ export class BeadsStore implements Store {
 
     // `--force` is mandatory: without it bd prints a preview and exits 0,
     // which would read as a successful removal that never happened.
-    const result = this.run(["delete", record.id, "--force"]);
+    const result = await this.run(["delete", record.id, "--force"]);
     if (result.status !== 0) this.fail(`delete ${record.id}`, result);
     return task;
   }
@@ -966,7 +989,7 @@ export class BeadsStore implements Store {
     to: State,
     opts: TransitionOpts = {},
   ): Promise<Task> {
-    const record = this.resolve(id);
+    const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
 
@@ -994,13 +1017,22 @@ export class BeadsStore implements Store {
     }
     task.links = deriveLinks(task.title);
 
+    // The durable completion stamp, independent of the current state. bd clears
+    // its own closed_at on reopen, so this namespaced value is the only record
+    // of when the work originally completed.
+    const priorClosed = record.metadata?.[META_CLOSED];
+    const closedEvidence =
+      typeof priorClosed === "string" ? priorClosed : task.closed;
+
     task.state = to;
     if (to === "done") {
       // Idempotent evidence backfill: a repeat completion keeps the ORIGINAL
       // close date rather than restamping it.
-      task.closed = task.closed ?? date;
+      task.closed = closedEvidence ?? date;
     } else {
       if (to === "in_flight" && !task.created) task.created = date;
+      // `Task.closed` is only surfaced for done work, but the evidence itself
+      // is retained below so a reopen does not lose it.
       delete task.closed;
     }
     task.updated = this.now();
@@ -1019,9 +1051,13 @@ export class BeadsStore implements Store {
     if (task.body !== undefined) {
       args.push("--description", task.body, "--allow-empty-description");
     }
-    args.push(...this.metaFlags(task));
+    args.push(
+      ...this.metaFlags(task, {
+        [META_CLOSED]: closedEvidence ?? (to === "done" ? date : null),
+      }),
+    );
 
-    const result = this.run(args);
+    const result = await this.run(args);
     if (result.status !== 0) this.fail(`transition ${record.id}`, result);
     return task;
   }
@@ -1030,7 +1066,7 @@ export class BeadsStore implements Store {
     id: string,
     mutation: PublicFollowupMutation,
   ): Promise<Task> {
-    const record = this.resolve(id);
+    const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
 
@@ -1102,15 +1138,15 @@ export class BeadsStore implements Store {
     // so a reader never observes a half-applied delivery.
     args.push(...this.metaFlags(task));
 
-    const result = this.run(args);
+    const result = await this.run(args);
     if (result.status !== 0) {
       this.fail(`public-followup ${record.id}`, result);
     }
     return task;
   }
 
-  private writeDep(id: string, dep: Dep): void {
-    const result = this.run([
+  private async writeDep(id: string, dep: Dep): Promise<void> {
+    const result = await this.run([
       "dep",
       "add",
       id,
@@ -1123,7 +1159,7 @@ export class BeadsStore implements Store {
 
   async addDep(id: string, dep: Dep): Promise<boolean> {
     const checkedDep = normalizeDep(id, dep);
-    const record = this.resolve(id);
+    const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
 
@@ -1146,7 +1182,7 @@ export class BeadsStore implements Store {
     ) {
       return false;
     }
-    if (!this.resolve(checkedDep.id)) {
+    if (!(await this.resolve(checkedDep.id))) {
       const label = checkedDep.type === "blocked-by" ? "blocker" : "dependency";
       throw new AxiError(
         `${label} "${checkedDep.id}" not found`,
@@ -1155,11 +1191,11 @@ export class BeadsStore implements Store {
       );
     }
 
-    this.writeDep(record.id, checkedDep);
+    await this.writeDep(record.id, checkedDep);
     if (checkedDep.reason) {
       task.deps.push(checkedDep);
       const flags = this.metaFlags(task);
-      const result = this.run(["update", record.id, ...flags]);
+      const result = await this.run(["update", record.id, ...flags]);
       if (result.status !== 0) this.fail(`dep reason ${record.id}`, result);
     }
     return true;
@@ -1167,7 +1203,7 @@ export class BeadsStore implements Store {
 
   async removeDep(id: string, dep: Dep): Promise<boolean> {
     const checkedDep: Dep = { ...dep, id: validateDependencyId(dep.id) };
-    const record = this.resolve(id);
+    const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
 
@@ -1179,7 +1215,7 @@ export class BeadsStore implements Store {
     ) {
       return false;
     }
-    const result = this.run(["dep", "remove", record.id, checkedDep.id]);
+    const result = await this.run(["dep", "remove", record.id, checkedDep.id]);
     if (result.status !== 0) {
       this.fail(`dep remove ${record.id} ${checkedDep.id}`, result);
     }
@@ -1188,7 +1224,7 @@ export class BeadsStore implements Store {
         !(existing.type === checkedDep.type && existing.id === checkedDep.id),
     );
     const flags = this.metaFlags(task);
-    const cleanup = this.run(["update", record.id, ...flags]);
+    const cleanup = await this.run(["update", record.id, ...flags]);
     if (cleanup.status !== 0) this.fail(`dep reason ${record.id}`, cleanup);
     return true;
   }
