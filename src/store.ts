@@ -27,7 +27,7 @@ export interface Capabilities {
   customStates: boolean;
   /** Does the server assign its own ids (remote trackers)? */
   serverMintsIds: boolean;
-  /** Can it move a connected set of tasks into another collection atomically? */
+  /** Can it move a connected set of tasks into another collection in one go? */
   collectionTransfer: boolean;
   /** Supports the durable, receipt-gated public-followup state machine. */
   publicFollowups: boolean;
@@ -80,11 +80,25 @@ export interface Store {
   ): Promise<Task>;
 
   /**
-   * Move a connected set of tasks into `destination` in one transaction, gated
-   * on the `collectionTransfer` capability: either every task lands in the
-   * destination and leaves this store, or none do. Backends that cannot honour
-   * that all-or-nothing guarantee omit it, and the command layer falls back to
-   * a single-task copy-then-remove rather than risking a half-applied move.
+   * Move a connected set of tasks into `destination`, gated on the
+   * `collectionTransfer` capability.
+   *
+   * Two separate record stores cannot generally share a transaction, so the
+   * guarantee is ordered and recoverable rather than literally atomic:
+   *
+   *  - Every destination write is staged BEFORE any source row is removed, so
+   *    any refusal or failure up to that point leaves this store untouched and
+   *    the destination clean.
+   *  - Each source removal is proved, not assumed. The first one that fails
+   *    stops the transfer: every source row not yet removed stays intact, the
+   *    destination copies of those same ids are rolled back, and the raised
+   *    error names which ids are now only in the destination, only here, or in
+   *    both — so an operator can finish or revert the move deliberately.
+   *  - On success every task is in the destination and gone from here.
+   *
+   * Backends that cannot honour even that omit the method, and the command
+   * layer falls back to a single-task copy-then-remove rather than risking a
+   * half-applied multi-task move.
    */
   transferMany?(ids: string[], destination: Store): Promise<Task[]>;
 

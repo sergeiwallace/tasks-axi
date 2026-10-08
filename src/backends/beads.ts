@@ -4,6 +4,8 @@ import { dirname } from "node:path";
 import { promisify } from "node:util";
 import {
   AxiError,
+  rollbackResidueError,
+  splitTransferError,
   stillBlockingError,
   strandedDepError,
 } from "../errors.js";
@@ -232,6 +234,8 @@ export class BeadsStore implements Store {
   private readonly prefix: string | undefined;
   private readonly now: () => string;
   private readonly runner: BeadsRunner | undefined;
+  /** Why the last `removeRow` call returned false. */
+  private lastRemovalDetail = "";
 
   constructor(options: BeadsStoreOptions) {
     this.beadsDir = options.path;
@@ -811,10 +815,12 @@ export class BeadsStore implements Store {
       );
     }
 
-    // `--force` is mandatory: without it bd prints a preview and exits 0,
-    // which would read as a successful removal that never happened.
-    const result = await this.run(["delete", record.id, "--force"]);
-    if (result.status !== 0) this.fail(`delete ${record.id}`, result);
+    if (!(await this.removeRow(record.id))) {
+      throw new AxiError(
+        `bd delete ${record.id} failed: ${this.lastRemovalDetail}`,
+        "UNKNOWN",
+      );
+    }
     return task;
   }
 
@@ -1103,13 +1109,20 @@ export class BeadsStore implements Store {
    * of the authoritative graph and into a `.md` file is the one thing this
    * adapter must never do.
    *
-   * Two Dolt graphs cannot share one transaction, so the all-or-nothing
-   * guarantee is built from ordering: every destination write happens first and
-   * is rolled back on any failure, so the SOURCE is left intact by every
-   * refusal and every error in the staging phase. Only once the whole set is
-   * present in the destination are the source rows removed, dependents before
-   * blockers, so the adapter's own active-dependents guard never trips on a row
-   * whose dependent is already gone.
+   * Two Dolt graphs cannot share one transaction, so this is NOT literally
+   * atomic and does not claim to be. It is ordered and recoverable:
+   *
+   *  1. Every destination row is staged first. Any refusal or error in that
+   *     phase rolls the whole staging back, leaving the SOURCE untouched.
+   *  2. Only then are the source rows removed, dependents before blockers, so
+   *     the adapter's own active-dependents guard never trips on a row whose
+   *     dependent is already gone. Each removal is PROVED by reading the row
+   *     back, not inferred from an exit status.
+   *  3. A failed removal stops the loop. Every source row not yet removed is
+   *     left intact, the destination copies of those same ids are rolled back,
+   *     and `splitTransferError` names which ids are now only in the
+   *     destination, only in the source, or (rollback refused) in both — so an
+   *     operator can finish or revert the move by hand.
    */
   async transferMany(ids: string[], destination: Store): Promise<Task[]> {
     if (!(destination instanceof BeadsStore)) {
@@ -1154,27 +1167,68 @@ export class BeadsStore implements Store {
         }
       }
     } catch (error) {
-      await destination.discardStaged(staged, error);
-    }
-
-    for (const task of this.removalOrder(tasks)) {
-      // `--force` is mandatory (bd exits 0 having deleted nothing without it),
-      // and the status must be read: an unchecked delete would leave the task
-      // in BOTH graphs while reporting a clean move.
-      const result = await this.run(["delete", task.id, "--force"]);
-      if (result.status !== 0) {
-        throw new AxiError(
-          `Move of "${task.id}" partially completed; it now exists in both graphs`,
-          "CONFLICT",
-          [
-            `Remove "${task.id}" from ${destination.beadsDir} manually, then retry`,
-            (result.stderr || result.stdout).trim().split("\n")[0] ||
-              `bd delete exited ${result.status}`,
-          ],
+      // Nothing has left the source yet, so the whole staged set is discarded
+      // and the source is left exactly as it was.
+      const stuck = await destination.discardStaged(staged);
+      if (stuck.length > 0) {
+        throw rollbackResidueError(
+          error,
+          stuck,
+          this.beadsDir,
+          destination.beadsDir,
         );
       }
+      throw error;
+    }
+
+    // Phase two: remove the source rows. A failure here STOPS the loop rather
+    // than widening the split: every source row not yet removed is left
+    // intact, the destination copies of those same ids are rolled back, and
+    // the raised error names which ids now live where.
+    const movedOnly: string[] = [];
+    for (const task of this.removalOrder(tasks)) {
+      if (await this.removeRow(task.id)) {
+        movedOnly.push(task.id);
+        continue;
+      }
+      const rollback = staged.filter((id) => !movedOnly.includes(id));
+      const stuck = await destination.discardStaged(rollback);
+      throw splitTransferError({
+        failed: task.id,
+        detail: this.lastRemovalDetail,
+        source: this.beadsDir,
+        destination: destination.beadsDir,
+        movedOnly,
+        returned: rollback.filter((id) => !stuck.includes(id)),
+        stuck,
+      });
     }
     return tasks;
+  }
+
+  /**
+   * Delete one row and PROVE it is gone. `--force` is mandatory (bd exits 0
+   * having deleted nothing without it) and the exit status alone still does not
+   * prove deletion, so the row's absence is read back before the caller may
+   * treat the id as removed. Returns false, with `lastRemovalDetail` set, so a
+   * caller can compensate rather than catch.
+   */
+  private async removeRow(id: string): Promise<boolean> {
+    let result: BeadsRunResult;
+    try {
+      result = await this.run(["delete", id, "--force"]);
+    } catch (error) {
+      this.lastRemovalDetail =
+        error instanceof Error ? error.message : String(error);
+      return false;
+    }
+    if (result.status === 0 && (await this.resolve(id)) === null) return true;
+    this.lastRemovalDetail =
+      (result.stderr || result.stdout).trim().split("\n")[0] ||
+      (result.status === 0
+        ? "bd delete exited 0 but the row is still in the graph"
+        : `bd delete exited ${result.status}`);
+    return false;
   }
 
   /**
@@ -1207,17 +1261,18 @@ export class BeadsStore implements Store {
     }
   }
 
-  /** Undo a partial staging so a failed transfer leaves the source intact. */
-  private async discardStaged(staged: string[], cause: unknown): Promise<never> {
+  /**
+   * Undo staged destination rows. Returns the ids it could NOT remove — a
+   * rollback delete can fail or silently delete nothing, and an unread result
+   * would report a clean undo while leaving the task in both graphs, so the
+   * residue is handed back for the caller to name in its error.
+   */
+  private async discardStaged(staged: string[]): Promise<string[]> {
+    const stuck: string[] = [];
     for (const id of [...staged].reverse()) {
-      try {
-        await this.run(["delete", id, "--force"]);
-      } catch {
-        // The original fault is what the operator must act on; a graph that
-        // refuses the rollback is reported through it rather than replacing it.
-      }
+      if (!(await this.removeRow(id))) stuck.push(id);
     }
-    throw cause;
+    return stuck;
   }
 
   /**

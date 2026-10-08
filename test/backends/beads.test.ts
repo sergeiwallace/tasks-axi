@@ -802,6 +802,129 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore cross-graph mv", () => {
     expect(readdirSync(bare)).toEqual([]);
   });
 
+  /**
+   * Failure injection. Two graphs cannot share a transaction, so what the
+   * contract actually promises is recoverability: the transfer stops at the
+   * first failed source removal, each id ends up in exactly one graph wherever
+   * the adapter can still reach it, and the error says which. The injection
+   * replaces ONE `bd delete` for ONE id and leaves every other invocation
+   * running against the real graph.
+   */
+  function failDeleteOf(store: BeadsStore, id: string): void {
+    const target = store as unknown as {
+      run: (args: string[]) => Promise<{
+        status: number;
+        stdout: string;
+        stderr: string;
+      }>;
+    };
+    const real = target.run.bind(store);
+    vi.spyOn(target, "run").mockImplementation(async (args: string[]) => {
+      if (args[0] === "delete" && args[1] === id) {
+        return { status: 1, stdout: "", stderr: "dolt: table is locked" };
+      }
+      return real(args);
+    });
+  }
+
+  it("test_transfer_many_when_a_source_delete_fails_then_stops_and_names_where_each_id_lives", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+    const landed = contextFor(destination).store;
+
+    await ctx.store.create({ id: "fi-blocker", title: "Lay the cable" });
+    await ctx.store.create({
+      id: "fi-dependent",
+      title: "Light the lamp",
+      deps: [{ type: "blocked-by", id: "fi-blocker", reason: "needs power" }],
+    });
+
+    // Removal order is dependents before blockers, so failing the BLOCKER's
+    // delete leaves the dependent already gone from the source.
+    failDeleteOf(ctx.store as BeadsStore, "fi-blocker");
+
+    let error: unknown;
+    try {
+      await mvCommand(
+        ["fi-blocker", "fi-dependent", "--to", destination.repo],
+        ctx,
+      );
+    } catch (caught) {
+      error = caught;
+    }
+    vi.restoreAllMocks();
+
+    expect(error).toBeInstanceOf(AxiError);
+    expect((error as AxiError).code).toBe("CONFLICT");
+    expect((error as Error).message).toContain("split across two collections");
+    const suggestions = (error as AxiError).suggestions.join("\n");
+    expect(suggestions).toContain("fi-dependent");
+    expect(suggestions).toContain("fi-blocker");
+    expect(suggestions).toContain("dolt: table is locked");
+
+    // The id whose removal failed is in exactly ONE graph: its source row was
+    // left intact and its destination copy rolled back.
+    expect((await ctx.store.get("fi-blocker"))?.title).toBe("Lay the cable");
+    expect(await landed.get("fi-blocker")).toBeNull();
+    // The id already removed from the source is in exactly ONE graph too.
+    expect(await ctx.store.get("fi-dependent")).toBeNull();
+    expect((await landed.get("fi-dependent"))?.title).toBe("Light the lamp");
+  });
+
+  it("test_transfer_many_when_the_first_source_delete_fails_then_nothing_leaves_the_source", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+    const landed = contextFor(destination).store;
+
+    await ctx.store.create({ id: "fi-solo", title: "Stay home" });
+    failDeleteOf(ctx.store as BeadsStore, "fi-solo");
+
+    let error: unknown;
+    try {
+      await mvCommand(["fi-solo", "--to", destination.repo], ctx);
+    } catch (caught) {
+      error = caught;
+    }
+    vi.restoreAllMocks();
+
+    expect((error as AxiError).code).toBe("CONFLICT");
+    expect((error as Error).message).toContain("no task left it");
+    expect((await ctx.store.get("fi-solo"))?.title).toBe("Stay home");
+    expect(await landed.get("fi-solo")).toBeNull();
+  });
+
+  it("test_transfer_many_when_rollback_delete_fails_then_names_the_residue", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+    const landed = contextFor(destination).store;
+
+    await ctx.store.create({ id: "fi-both", title: "In both graphs" });
+    // Called directly rather than through `mv`, because the residue is created
+    // by the DESTINATION store refusing the rollback and `mv` builds that
+    // instance internally.
+    failDeleteOf(landed as BeadsStore, "fi-both");
+    failDeleteOf(ctx.store as BeadsStore, "fi-both");
+
+    let error: unknown;
+    try {
+      await (ctx.store as BeadsStore).transferMany(["fi-both"], landed);
+    } catch (caught) {
+      error = caught;
+    }
+    vi.restoreAllMocks();
+
+    expect((error as AxiError).code).toBe("CONFLICT");
+    const suggestions = (error as AxiError).suggestions.join("\n");
+    expect(suggestions).toContain("In BOTH collections");
+    expect(suggestions).toContain("fi-both");
+    // Reported honestly: the row really is in both graphs now.
+    expect((await ctx.store.get("fi-both"))?.title).toBe("In both graphs");
+    expect((await landed.get("fi-both"))?.title).toBe("In both graphs");
+  });
+
   it("test_transfer_many_when_destination_is_not_a_graph_then_names_the_backend", async () => {
     const store = contextFor(freshGraph()).store as BeadsStore;
     await store.create({ id: "mv-direct", title: "Direct call" });

@@ -90,6 +90,84 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Where each id of an interrupted multi-task transfer ended up. */
+export interface SplitTransferState {
+  /** The id whose source removal failed, stopping the transfer. */
+  failed: string;
+  /** What the backend reported for the failed removal. */
+  detail: string;
+  source: string;
+  destination: string;
+  /** Removed from the source already: now only in the destination. */
+  movedOnly: string[];
+  /** Destination copy rolled back: still only in the source. */
+  returned: string[];
+  /** Destination copy could not be rolled back: in BOTH collections. */
+  stuck: string[];
+}
+
+/**
+ * A multi-task move that could not be completed as one unit. Two record stores
+ * cannot share a transaction, so the operator-facing contract is not
+ * all-or-nothing but *recoverable*: the transfer stops at the first failed
+ * source removal, every untouched source row is left alone, and this error
+ * names exactly which ids now live where so the move can be finished or
+ * reverted by hand. Lives here, beside `partialMoveError`, so the wording an
+ * operator acts on cannot drift between the backends that raise it.
+ */
+export function splitTransferError(state: SplitTransferState): AxiError {
+  const split = state.movedOnly.length > 0 || state.stuck.length > 0;
+  const suggestions: string[] = [];
+  if (state.movedOnly.length > 0) {
+    suggestions.push(
+      `Now only in ${state.destination}: ${state.movedOnly.join(", ")}`,
+    );
+  }
+  if (state.returned.length > 0) {
+    suggestions.push(
+      `Still only in ${state.source}: ${state.returned.join(", ")}`,
+    );
+  }
+  if (state.stuck.length > 0) {
+    suggestions.push(
+      `In BOTH collections — remove from ${state.destination} by hand: ${state.stuck.join(", ")}`,
+    );
+  }
+  if (split) {
+    suggestions.push(
+      `Finish the move by re-running it for the ids still in ${state.source}, or revert it by moving the others back`,
+    );
+  }
+  suggestions.push(`Source removal failed: ${state.detail}`);
+  return new AxiError(
+    split
+      ? `Move of "${state.failed}" could not remove it from ${state.source}; the set is now split across two collections`
+      : `Move of "${state.failed}" was refused by ${state.source}; no task left it and every destination copy was rolled back`,
+    "CONFLICT",
+    suggestions,
+  );
+}
+
+/**
+ * The source is intact but rolling the destination back left copies behind, so
+ * the operator is told about the original fault AND the residue.
+ */
+export function rollbackResidueError(
+  cause: unknown,
+  stuck: string[],
+  source: string,
+  destination: string,
+): AxiError {
+  return new AxiError(
+    `Transfer failed, and rolling the destination back left ${stuck.join(", ")} in ${destination}`,
+    "CONFLICT",
+    [
+      `Every task is still in ${source}; remove ${stuck.join(", ")} from ${destination} by hand, then retry`,
+      `Transfer failed: ${describeError(cause)}`,
+    ],
+  );
+}
+
 /**
  * A capability the active backend does not support was requested. The
  * capability is named so the error is actionable rather than a raw failure
