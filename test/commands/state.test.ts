@@ -1,4 +1,10 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -878,6 +884,46 @@ describe("state commands", () => {
           to: target.path,
         });
         expect(readFileSync(target.path, "utf8")).toContain("cert-cleanup");
+      } finally {
+        b.cleanup();
+        target.cleanup();
+      }
+    });
+
+    it("test_mv_when_destination_dir_holds_a_beads_graph_then_refuses_and_writes_nothing", async () => {
+      const b = makeBacklog();
+      const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+      try {
+        // A repository directory HOLDING a graph, which is how `--to` names a
+        // destination repo. Reading only the final path segment let this fall
+        // through to data/backlog.md and import a graph-owned task into
+        // markdown, contradicting the documented two-way refusal.
+        mkdirSync(join(target.dir, ".beads"), { recursive: true });
+
+        await expect(
+          mvCommand(["cert-cleanup", "--to", target.dir], b.ctx),
+        ).rejects.toMatchObject({ code: "UNSUPPORTED" });
+
+        // Nothing moved and nothing was written beside the graph.
+        expect(b.read()).toContain("cert-cleanup");
+        expect(existsSync(join(target.dir, "data", "backlog.md"))).toBe(false);
+        expect(readFileSync(target.path, "utf8")).not.toContain("cert-cleanup");
+      } finally {
+        b.cleanup();
+        target.cleanup();
+      }
+    });
+
+    it("test_mv_when_destination_dir_has_no_beads_graph_then_still_resolves_a_backlog", async () => {
+      const b = makeBacklog();
+      const target = makeBacklog("# Backlog\n\n## Queued\n\n## Done\n");
+      try {
+        // The negative arm of the same guard: without a graph the directory is
+        // an ordinary markdown destination, so the refusal discriminates on the
+        // graph rather than on "the path is a directory".
+        await mvCommand(["cert-cleanup", "--to", target.dir], b.ctx);
+        expect(readFileSync(target.path, "utf8")).toContain("cert-cleanup");
+        expect(b.read()).not.toContain("cert-cleanup");
       } finally {
         b.cleanup();
         target.cleanup();

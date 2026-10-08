@@ -749,7 +749,7 @@ function resolveMoveDestination(
 
   if (config.backend === "beads") {
     if (base.endsWith(".md")) throw crossRecordMoveError(to, "beads");
-    const graph = basename(base) === BEADS_DIR ? base : resolve(base, BEADS_DIR);
+    const graph = beadsGraphAt(base);
     if (!existsSync(graph) || !statSync(graph).isDirectory()) {
       throw new AxiError(
         `--to "${to}" does not name a beads graph`,
@@ -767,13 +767,39 @@ function resolveMoveDestination(
     };
   }
 
-  if (basename(base) === BEADS_DIR) throw crossRecordMoveError(to, "markdown");
+  if (isBeadsGraphPath(base)) throw crossRecordMoveError(to, "markdown");
   const path = resolveBacklogTarget(to);
   return {
     config: { backend: config.backend, path, doneKeep: config.doneKeep, beads: config.beads },
     path,
     current: config.path,
   };
+}
+
+/**
+ * Which path a `--to` of `path` names if it names a beads graph at all — the
+ * `.beads` directory itself, or the one inside a repository directory. This is
+ * the SAME rule the config resolver applies when selecting the source graph
+ * (`[beads] dir` resolves to `<dir>/.beads`).
+ */
+function beadsGraphAt(path: string): string {
+  return basename(path) === BEADS_DIR ? path : resolve(path, BEADS_DIR);
+}
+
+/**
+ * Does `--to` denote a beads graph? Both directions of the cross-record
+ * refusal must agree on the answer, so it is answered in one place. A
+ * repository directory HOLDING a graph counts: reading only the final path
+ * segment let `--to ../other-repo` fall through to `data/backlog.md` and
+ * export a graph task into a markdown file — the one thing the two-way
+ * refusal exists to prevent. A path literally named `.beads` is refused on its
+ * name alone, whether or not it exists yet, so the refusal does not depend on
+ * when the directory was created.
+ */
+function isBeadsGraphPath(path: string): boolean {
+  if (basename(path) === BEADS_DIR) return true;
+  const graph = beadsGraphAt(path);
+  return existsSync(graph) && statSync(graph).isDirectory();
 }
 
 function crossRecordMoveError(to: string, backend: string): AxiError {
