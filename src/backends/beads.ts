@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
   AxiError,
@@ -37,6 +37,7 @@ import {
   type PublicFollowupMutation,
 } from "../public-followup.js";
 import type { Capabilities, Store } from "../store.js";
+import { withLock, withLocks } from "./lock.js";
 import { deriveLinks } from "./markdown-grammar.js";
 // Field normalization is shared with every other backend (PR #52's extraction),
 // so a task accepted by the markdown backend is accepted here byte-for-byte.
@@ -294,6 +295,45 @@ export class BeadsStore implements Store {
     }
   }
 
+  /**
+   * The advisory-lock target for this graph, beside the graph directory so
+   * every tasks-axi process addressing the same `.beads` serializes on the
+   * same file (`lock.ts` appends `.lock`).
+   */
+  private get lockTarget(): string {
+    return join(this.beadsDir, ".tasks-axi");
+  }
+
+  /**
+   * Serialize ONE mutation against this graph.
+   *
+   * bd 1.3.0 offers compare-and-set guards for `status` and `assignee`
+   * (`--if-status` / `--if-assignee`, exit 13) but none for a metadata
+   * revision, and `revision` does not advance on an edge write — so no
+   * conditional write can make a read-validate-write over namespaced metadata
+   * safe, which is exactly what a public-followup revision bump is. bd's own
+   * database lock only serializes ONE invocation, not the read and the write
+   * either side of this adapter's validation, so an advisory lock held across
+   * the WHOLE read-validate-write is the only sound primitive available.
+   *
+   * It is taken for every mutation rather than only the followup path:
+   * mutations serialized against different locks are not serialized at all,
+   * and `update`/`transition`/`addDep` all rewrite the same owned metadata
+   * patch from a value they read earlier. Contention fails closed with
+   * `LOCKED`, as the markdown backend does.
+   *
+   * Reads stay lock-free: a single-row read is already consistent, and
+   * serializing reads would buy nothing a caller could rely on.
+   *
+   * The graph check comes FIRST. Acquiring the lock creates the directory it
+   * would sit in, so locking before checking would turn "no graph here" into a
+   * silent write beside a graph that does not exist.
+   */
+  private async mutate<T>(fn: () => Promise<T>): Promise<T> {
+    this.requireGraph();
+    return withLock(this.lockTarget, fn);
+  }
+
   private async run(args: string[]): Promise<BeadsRunResult> {
     this.requireGraph();
     if (this.runner) return this.runner(args);
@@ -544,6 +584,69 @@ export class BeadsStore implements Store {
   }
 
   // -------------------------------------------------------------------------
+  // Mutations
+  //
+  // Every public mutator is a thin wrapper that takes the graph's advisory
+  // lock once and delegates to an `*Unlocked` body. The bodies call each other
+  // directly (a transfer stages rows in the destination), so re-entering
+  // through a public verb would deadlock on a lock this call already holds.
+  // -------------------------------------------------------------------------
+
+  async create(input: TaskInput): Promise<Task> {
+    return this.mutate(() => this.createUnlocked(input));
+  }
+
+  async update(id: string, patch: TaskPatch): Promise<TaskUpdateResult> {
+    return this.mutate(() => this.updateUnlocked(id, patch));
+  }
+
+  async remove(id: string): Promise<Task> {
+    return this.mutate(() => this.removeUnlocked(id));
+  }
+
+  async transition(
+    id: string,
+    to: State,
+    opts: TransitionOpts = {},
+  ): Promise<Task> {
+    return this.mutate(() => this.transitionUnlocked(id, to, opts));
+  }
+
+  async updatePublicFollowup(
+    id: string,
+    mutation: PublicFollowupMutation,
+  ): Promise<Task> {
+    return this.mutate(() => this.updatePublicFollowupUnlocked(id, mutation));
+  }
+
+  async addDep(id: string, dep: Dep): Promise<boolean> {
+    return this.mutate(() => this.addDepUnlocked(id, dep));
+  }
+
+  async removeDep(id: string, dep: Dep): Promise<boolean> {
+    return this.mutate(() => this.removeDepUnlocked(id, dep));
+  }
+
+  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
+    if (!(destination instanceof BeadsStore)) {
+      throw new AxiError(
+        `The beads backend can only transfer tasks into another beads graph, not "${destination.capabilities().backend}"`,
+        "UNSUPPORTED",
+        ["Point --to at a repository holding a .beads directory"],
+      );
+    }
+    this.requireGraph();
+    destination.requireGraph();
+    // Both graphs are locked for the whole transfer. `withLocks` orders them by
+    // resolved path, so two transfers in opposite directions cannot deadlock,
+    // and dedupes, so a graph transferring to itself takes one lock rather
+    // than blocking on itself.
+    return withLocks([this.lockTarget, destination.lockTarget], () =>
+      this.transferManyUnlocked(ids, destination),
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // CRUD
   // -------------------------------------------------------------------------
 
@@ -607,7 +710,7 @@ export class BeadsStore implements Store {
     return task;
   }
 
-  async create(input: TaskInput): Promise<Task> {
+  private async createUnlocked(input: TaskInput): Promise<Task> {
     const task = this.taskFromInput(input);
     if (await this.resolve(task.id)) {
       throw new AxiError(`Task "${task.id}" already exists`, "CONFLICT");
@@ -649,7 +752,10 @@ export class BeadsStore implements Store {
     return task;
   }
 
-  async update(id: string, patch: TaskPatch): Promise<TaskUpdateResult> {
+  private async updateUnlocked(
+    id: string,
+    patch: TaskPatch,
+  ): Promise<TaskUpdateResult> {
     const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
@@ -784,7 +890,7 @@ export class BeadsStore implements Store {
     return { task, changed };
   }
 
-  async remove(id: string): Promise<Task> {
+  private async removeUnlocked(id: string): Promise<Task> {
     const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
     const task = this.toTask(record);
@@ -839,10 +945,10 @@ export class BeadsStore implements Store {
   // State + dependencies
   // -------------------------------------------------------------------------
 
-  async transition(
+  private async transitionUnlocked(
     id: string,
     to: State,
-    opts: TransitionOpts = {},
+    opts: TransitionOpts,
   ): Promise<Task> {
     const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
@@ -917,7 +1023,7 @@ export class BeadsStore implements Store {
     return task;
   }
 
-  async updatePublicFollowup(
+  private async updatePublicFollowupUnlocked(
     id: string,
     mutation: PublicFollowupMutation,
   ): Promise<Task> {
@@ -1012,7 +1118,7 @@ export class BeadsStore implements Store {
     if (result.status !== 0) this.fail(`dep add ${id} ${dep.id}`, result);
   }
 
-  async addDep(id: string, dep: Dep): Promise<boolean> {
+  private async addDepUnlocked(id: string, dep: Dep): Promise<boolean> {
     const checkedDep = normalizeDep(id, dep);
     const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
@@ -1074,7 +1180,7 @@ export class BeadsStore implements Store {
     return true;
   }
 
-  async removeDep(id: string, dep: Dep): Promise<boolean> {
+  private async removeDepUnlocked(id: string, dep: Dep): Promise<boolean> {
     const checkedDep: Dep = { ...dep, id: validateDependencyId(dep.id) };
     const record = await this.resolve(id);
     if (!record) throw new AxiError(`Task "${id}" not found`, "NOT_FOUND");
@@ -1124,14 +1230,10 @@ export class BeadsStore implements Store {
    *     destination, only in the source, or (rollback refused) in both — so an
    *     operator can finish or revert the move by hand.
    */
-  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
-    if (!(destination instanceof BeadsStore)) {
-      throw new AxiError(
-        `The beads backend can only transfer tasks into another beads graph, not "${destination.capabilities().backend}"`,
-        "UNSUPPORTED",
-        ["Point --to at a repository holding a .beads directory"],
-      );
-    }
+  private async transferManyUnlocked(
+    ids: string[],
+    destination: BeadsStore,
+  ): Promise<Task[]> {
     const uniqueIds = [...new Set(ids)];
 
     const tasks: Task[] = [];
@@ -1158,12 +1260,12 @@ export class BeadsStore implements Store {
     const staged: string[] = [];
     try {
       for (const task of tasks) {
-        await destination.create(taskToInput({ ...task, deps: [] }));
+        await destination.createUnlocked(taskToInput({ ...task, deps: [] }));
         staged.push(task.id);
       }
       for (const task of tasks) {
         for (const dep of task.deps) {
-          await destination.addDep(task.id, dep);
+          await destination.addDepUnlocked(task.id, dep);
         }
       }
     } catch (error) {

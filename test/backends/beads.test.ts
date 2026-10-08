@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { BeadsStore } from "../../src/backends/beads.js";
+import { isLocked } from "../../src/backends/lock.js";
 import { MarkdownStore } from "../../src/backends/markdown.js";
 import { mvCommand } from "../../src/commands/state.js";
 import { AxiError } from "../../src/errors.js";
+import { decodePublicFollowup } from "../../src/public-followup.js";
 import type { DepType, State } from "../../src/model.js";
 import type { Store } from "../../src/store.js";
 import {
@@ -102,6 +104,48 @@ function rawShow(graph: Graph, id: string): Record<string, unknown> {
 function metadataOf(graph: Graph, id: string): Record<string, unknown> {
   return (rawShow(graph, id).metadata ?? {}) as Record<string, unknown>;
 }
+
+/**
+ * One valid obligation fixture, shared by the mapping suite and the
+ * concurrency suite below.
+ */
+const FOLLOWUP = {
+  schema_version: 1 as const,
+  revision: 1,
+  request: {
+    request_id: "req-public-demo",
+    platform: "discord" as const,
+    context_binding: { version: "ctx1" as const, value: "ctx1_opaque_demo" },
+    public_safe_summary: "Follow up when the public-safe fix ships",
+    received_at: "2026-07-13T12:00:00Z",
+    followup_expires_at: "2026-08-13T12:00:00Z",
+    reservation_expires_at: "2026-09-13T12:00:00Z",
+  },
+  purpose: "promised-final" as const,
+  expected_final: {
+    type: "pr-merged" as const,
+    project: "demo",
+    required_deliverables: ["pr_url"],
+    completion_policy: "all-required" as const,
+  },
+  obligation_expires_at: "2026-08-13T12:00:00Z",
+  delivery: {
+    state: "intent" as const,
+    delivery_key: "fd1_demo",
+    payload_digest: null,
+    attempt_count: 0,
+    last_error_code: null,
+    next_attempt_at: null,
+    receipt: null,
+    last_error: null,
+    waiver: null,
+  },
+  work_relations: [],
+  lineage: {
+    predecessor_obligation_id: null,
+    successor_obligation_id: null,
+  },
+};
 
 describe.skipIf(!BD_AVAILABLE)("BeadsStore against a disposable graph", () => {
   let graph: Graph;
@@ -469,44 +513,6 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore against a disposable graph", () => {
 
   // ---- public followups ---------------------------------------------------
 
-  const FOLLOWUP = {
-    schema_version: 1 as const,
-    revision: 1,
-    request: {
-      request_id: "req-public-demo",
-      platform: "discord" as const,
-      context_binding: { version: "ctx1" as const, value: "ctx1_opaque_demo" },
-      public_safe_summary: "Follow up when the public-safe fix ships",
-      received_at: "2026-07-13T12:00:00Z",
-      followup_expires_at: "2026-08-13T12:00:00Z",
-      reservation_expires_at: "2026-09-13T12:00:00Z",
-    },
-    purpose: "promised-final" as const,
-    expected_final: {
-      type: "pr-merged" as const,
-      project: "demo",
-      required_deliverables: ["pr_url"],
-      completion_policy: "all-required" as const,
-    },
-    obligation_expires_at: "2026-08-13T12:00:00Z",
-    delivery: {
-      state: "intent" as const,
-      delivery_key: "fd1_demo",
-      payload_digest: null,
-      attempt_count: 0,
-      last_error_code: null,
-      next_attempt_at: null,
-      receipt: null,
-      last_error: null,
-      waiver: null,
-    },
-    work_relations: [],
-    lineage: {
-      predecessor_obligation_id: null,
-      successor_obligation_id: null,
-    },
-  };
-
   it("test_create_when_public_followup_then_typed_payload_round_trips", async () => {
     const task = await store.create({
       id: "public-final-ab",
@@ -645,6 +651,201 @@ describe("BeadsStore graph resolution", () => {
       code: "UNSUPPORTED",
     });
     rmSync(graphDir, { recursive: true, force: true });
+  });
+});
+
+/**
+ * Concurrent mutation. bd 1.3.0 has no conditional write for a metadata
+ * revision, so the adapter's read-validate-write is only safe behind an
+ * advisory lock on the graph. These cases drive two mutations at once against
+ * ONE graph and assert that exactly one of them lands.
+ */
+describe.skipIf(!BD_AVAILABLE)("BeadsStore concurrent mutation", () => {
+  const graphs: Graph[] = [];
+
+  function freshStore(): { graph: Graph; store: BeadsStore } {
+    const graph = makeGraph();
+    graphs.push(graph);
+    return {
+      graph,
+      store: new BeadsStore({
+        path: graph.beadsDir,
+        binary: "bd",
+        now: () => "2026-07-01",
+      }),
+    };
+  }
+
+  afterAll(() => {
+    for (const graph of graphs) {
+      rmSync(graph.repo, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Two bd invocations fired back to back are already serialized by bd's own
+   * database lock, which is exactly why that lock is NOT a substitute: it
+   * covers one invocation, not the read and the write either side of this
+   * adapter's validation. The window is therefore opened deliberately, by
+   * holding one writer between its read and its write — the think-time a real
+   * caller spends in validation (`requireUnblocked` issues a whole `list`) and
+   * what a second OS process provides for free.
+   */
+  function delayBeforeWrite(store: BeadsStore, ms: number): void {
+    const target = store as unknown as {
+      run: (args: string[]) => Promise<{
+        status: number;
+        stdout: string;
+        stderr: string;
+      }>;
+    };
+    const real = target.run.bind(store);
+    vi.spyOn(target, "run").mockImplementation(async (args: string[]) => {
+      if (args[0] === "update") {
+        await new Promise((done) => setTimeout(done, ms));
+      }
+      return real(args);
+    });
+  }
+
+  function storeOn(graph: Graph): BeadsStore {
+    return new BeadsStore({
+      path: graph.beadsDir,
+      binary: "bd",
+      now: () => "2026-07-01",
+    });
+  }
+
+  it("test_update_public_followup_when_a_writer_holds_the_window_then_the_second_is_refused", async () => {
+    const { graph, store } = freshStore();
+    await store.create({
+      id: "race-final-1",
+      title: FOLLOWUP.request.public_safe_summary,
+      kind: "public-followup",
+      public_followup: FOLLOWUP,
+    });
+
+    // Two separate stores on ONE graph, as two processes would be.
+    const slow = storeOn(graph);
+    const quick = storeOn(graph);
+    delayBeforeWrite(slow, 1_200);
+
+    // Both writers expect revision 1, so both would pass revision validation
+    // on a read taken before the other's write.
+    const mutation = {
+      expectedRevision: 1,
+      expectedPublicFollowup: FOLLOWUP,
+      publicFollowup: { ...FOLLOWUP, revision: 2 },
+    };
+    const first = slow.updatePublicFollowup("race-final-1", mutation);
+    await new Promise((done) => setTimeout(done, 150));
+    const outcomes = await Promise.allSettled([
+      first,
+      quick.updatePublicFollowup("race-final-1", mutation),
+    ]);
+    vi.restoreAllMocks();
+
+    const landed = outcomes.filter((o) => o.status === "fulfilled");
+    const refused = outcomes.filter((o) => o.status === "rejected");
+    expect(landed).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    // Fails closed either way: the loser is turned away by the lock itself, or
+    // by the revision guard once it can see the winner's write.
+    const reason = (refused[0] as PromiseRejectedResult).reason as AxiError;
+    expect(reason).toBeInstanceOf(AxiError);
+    expect(["CONFLICT", "LOCKED"]).toContain(reason.code);
+
+    // One write landed, so the revision advanced by exactly one — read back
+    // from the graph's own stored bytes, not from the adapter's return value.
+    expect((await store.get("race-final-1"))?.public_followup?.revision).toBe(2);
+    const stored = metadataOf(graph, "race-final-1")["axi.public_followup"];
+    expect(typeof stored).toBe("string");
+    expect(decodePublicFollowup(stored as string).revision).toBe(2);
+  });
+
+  it("test_generic_update_when_a_writer_holds_the_window_then_the_second_is_not_lost", async () => {
+    const { graph, store } = freshStore();
+    await store.create({ id: "race-meta-1", title: "Shared row" });
+
+    // The same window on the GENERIC path: `update` rewrites the whole owned
+    // metadata patch from a value it read earlier, so an interleaved writer's
+    // field is silently dropped rather than reported.
+    const slow = storeOn(graph);
+    const quick = storeOn(graph);
+    delayBeforeWrite(slow, 1_200);
+
+    const first = slow.update("race-meta-1", { repo: "alpha" });
+    await new Promise((done) => setTimeout(done, 150));
+    const outcomes = await Promise.allSettled([
+      first,
+      quick.update("race-meta-1", { kind: "chore" }),
+    ]);
+    vi.restoreAllMocks();
+
+    // Neither write is lost: whichever goes second reads the other's committed
+    // row, so both fields are in the graph. A refusal is acceptable too — what
+    // is not is a success that silently dropped the other field.
+    for (const outcome of outcomes) {
+      if (outcome.status === "rejected") {
+        expect(["LOCKED", "CONFLICT"]).toContain(
+          (outcome.reason as AxiError).code,
+        );
+      }
+    }
+    const applied = outcomes.filter((o) => o.status === "fulfilled").length;
+    const task = await store.get("race-meta-1");
+    const survived = [task?.repo === "alpha", task?.kind === "chore"].filter(
+      Boolean,
+    ).length;
+    expect(survived).toBe(applied);
+    const raw = metadataOf(graph, "race-meta-1");
+    if (task?.repo === "alpha") expect(raw["axi.repo"]).toBe("alpha");
+    if (task?.kind === "chore") expect(raw["axi.kind"]).toBe("chore");
+  });
+
+  it("test_every_mutation_verb_when_running_then_the_graph_lock_is_held", async () => {
+    const { graph, store } = freshStore();
+    await store.create({ id: "lock-probe-1", title: "Probe" });
+    await store.create({ id: "lock-probe-2", title: "Probe blocker" });
+
+    // One lock, ALL mutations: a mutation serialized against no lock is not
+    // serialized at all, so each verb is observed while it is in flight.
+    const lockTarget = join(graph.beadsDir, ".tasks-axi");
+    const observed = new Map<string, boolean>();
+    async function probe(verb: string, call: () => Promise<unknown>) {
+      const inFlight = call();
+      // Sampled before the call settles; `isLocked` is the same helper the
+      // markdown backend's lock is verified with.
+      observed.set(verb, isLocked(lockTarget));
+      await inFlight;
+    }
+
+    await probe("create", () =>
+      store.create({ id: "lock-probe-3", title: "Created under lock" }),
+    );
+    await probe("update", () => store.update("lock-probe-1", { repo: "beta" }));
+    await probe("transition", () => store.transition("lock-probe-1", "done"));
+    await probe("addDep", () =>
+      store.addDep("lock-probe-3", { type: "blocked-by", id: "lock-probe-2" }),
+    );
+    await probe("removeDep", () =>
+      store.removeDep("lock-probe-3", {
+        type: "blocked-by",
+        id: "lock-probe-2",
+      }),
+    );
+    await probe("remove", () => store.remove("lock-probe-3"));
+
+    expect([...observed.entries()]).toEqual([
+      ["create", true],
+      ["update", true],
+      ["transition", true],
+      ["addDep", true],
+      ["removeDep", true],
+      ["remove", true],
+    ]);
+    // Released afterwards, so a later caller is not locked out by a leak.
+    expect(isLocked(lockTarget)).toBe(false);
   });
 });
 
