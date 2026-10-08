@@ -1246,6 +1246,136 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore cross-graph mv", () => {
     expect((await landed.get("fi-both"))?.title).toBe("In both graphs");
   });
 
+  /**
+   * The `parent` arm of the rollback guard. Same shape as the `blocked-by` case
+   * above, and the ids are passed child-first so `removalOrder` produces the
+   * same order either way: what this isolates is the rollback's own
+   * "does anything still reference this row" question, which asked only about
+   * blocking edges and so would delete the parent out from under its child.
+   */
+  it("test_transfer_many_when_rollback_would_strip_a_parent_edge_then_keeps_the_endpoint_and_names_it", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+    const landed = contextFor(destination).store;
+
+    await ctx.store.create({ id: "pe-parent", title: "Wire the harness" });
+    await ctx.store.create({
+      id: "pe-child",
+      title: "Crimp one connector",
+      deps: [{ type: "parent", id: "pe-parent", reason: "epic rollup" }],
+    });
+
+    failDeleteOf(ctx.store as BeadsStore, "pe-parent");
+
+    let error: unknown;
+    try {
+      await mvCommand(["pe-child", "pe-parent", "--to", destination.repo], ctx);
+    } catch (caught) {
+      error = caught;
+    }
+    vi.restoreAllMocks();
+
+    expect((error as AxiError).code).toBe("CONFLICT");
+
+    // The surviving child keeps its parent edge AND the reason carried on it.
+    expect((await landed.get("pe-child"))?.deps).toEqual([
+      { type: "parent", id: "pe-parent", reason: "epic rollup" },
+    ]);
+    // Proved against bd itself, not against the adapter that kept the row.
+    expect(rawExists(destination, "pe-parent")).toBe(true);
+    expect((await ctx.store.get("pe-parent"))?.title).toBe("Wire the harness");
+
+    const suggestions = (error as AxiError).suggestions.join("\n");
+    expect(suggestions).toContain("kept in");
+    expect(suggestions).toContain("pe-parent");
+  });
+
+  /**
+   * The `discovered-from` arm of the removal ORDER. The ids are passed
+   * endpoint-first, so an order that only knows about `blocked-by` edges
+   * removes the endpoint before its dependent; when the dependent's own removal
+   * then fails it stays in the SOURCE with its edge already stripped by bd, and
+   * no retry restores it.
+   */
+  it("test_transfer_many_when_a_removal_fails_then_a_discovered_from_edge_left_in_the_source_is_intact", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+    const landed = contextFor(destination).store;
+
+    await ctx.store.create({ id: "df-origin", title: "Audit the loader" });
+    await ctx.store.create({
+      id: "df-finding",
+      title: "Loader drops the last row",
+      deps: [
+        { type: "discovered-from", id: "df-origin", reason: "found mid-audit" },
+      ],
+    });
+
+    failDeleteOf(ctx.store as BeadsStore, "df-finding");
+
+    let error: unknown;
+    try {
+      await mvCommand(["df-origin", "df-finding", "--to", destination.repo], ctx);
+    } catch (caught) {
+      error = caught;
+    }
+    vi.restoreAllMocks();
+
+    expect((error as AxiError).code).toBe("CONFLICT");
+    // Dependent first, so the very first removal failed and nothing left.
+    expect((error as Error).message).toContain("no task left it");
+    expect((await ctx.store.get("df-origin"))?.title).toBe("Audit the loader");
+    expect((await ctx.store.get("df-finding"))?.deps).toEqual([
+      { type: "discovered-from", id: "df-origin", reason: "found mid-audit" },
+    ]);
+    expect(await landed.get("df-origin")).toBeNull();
+    expect(await landed.get("df-finding")).toBeNull();
+  });
+
+  /**
+   * Split-move refusal across a `parent` edge. The control is
+   * `test_mv_when_connected_set_moves_between_graphs_then_only_destination_holds_them`:
+   * a set whose edges travel together still transfers. Here the child stays, so
+   * removing the parent would strip its edge, and the refusal lands before any
+   * write with the edge type named — not the "still blocking" wording, because
+   * a `parent` edge blocks nothing.
+   */
+  it("test_mv_when_a_parent_edge_would_split_the_set_then_refuses_before_any_write", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+
+    await ctx.store.create({ id: "sp-parent", title: "Rebuild the deck" });
+    await ctx.store.create({
+      id: "sp-child",
+      title: "Sand one plank",
+      deps: [{ type: "parent", id: "sp-parent", reason: "epic rollup" }],
+    });
+
+    let error: unknown;
+    try {
+      await mvCommand(["sp-parent", "--to", destination.repo], ctx);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect((error as AxiError).code).toBe("VALIDATION_ERROR");
+    expect((error as Error).message).toContain("sp-child (parent)");
+    expect((error as Error).message).toContain("strip that edge");
+    expect((error as AxiError).suggestions.join("\n")).toContain(
+      "Move them together",
+    );
+
+    // Nothing was written on either side, and the child's edge is untouched.
+    expect(rawExists(destination, "sp-parent")).toBe(false);
+    expect((await ctx.store.get("sp-parent"))?.title).toBe("Rebuild the deck");
+    expect((await ctx.store.get("sp-child"))?.deps).toEqual([
+      { type: "parent", id: "sp-parent", reason: "epic rollup" },
+    ]);
+  });
+
   it("test_transfer_many_when_destination_is_not_a_graph_then_names_the_backend", async () => {
     const store = contextFor(freshGraph()).store as BeadsStore;
     await store.create({ id: "mv-direct", title: "Direct call" });

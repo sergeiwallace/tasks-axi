@@ -1,5 +1,5 @@
 import { AxiError, exitCodeForError } from "axi-sdk-js";
-import type { Dep } from "./model.js";
+import type { Dep, DepType } from "./model.js";
 import {
   type SuggestionGlobals,
   withSuggestionGlobals,
@@ -47,6 +47,30 @@ export function stillBlockingError(id: string, stranded: string[]): AxiError {
     "VALIDATION_ERROR",
     [
       `Move them together, or unblock them first, e.g. \`tasks-axi unblock ${stranded[0]} --by ${id}\``,
+    ],
+  );
+}
+
+/**
+ * Moving `id` out of a collection would leave rows behind that reference it
+ * through a NON-blocking edge (`parent`, `discovered-from`). Separate wording
+ * from `stillBlockingError` because nothing here is blocked: what is at stake
+ * is the edge itself. On a graph backend `bd delete --force` strips the
+ * deleted row's edges off its surviving dependents, so the edge and its reason
+ * would be lost with no retry able to restore them.
+ */
+export function strandedDependentError(
+  id: string,
+  dependents: { id: string; type: DepType }[],
+): AxiError {
+  const named = dependents
+    .map((dependent) => `${dependent.id} (${dependent.type})`)
+    .join(", ");
+  return new AxiError(
+    `Task "${id}" is still referenced by ${named}: moving it would strip that edge`,
+    "VALIDATION_ERROR",
+    [
+      `Move them together, or remove the edge first, e.g. \`bd dep remove ${dependents[0].id} ${id}\``,
     ],
   );
 }

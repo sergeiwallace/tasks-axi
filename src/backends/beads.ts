@@ -7,6 +7,7 @@ import {
   rollbackResidueError,
   splitTransferError,
   stillBlockingError,
+  strandedDependentError,
   strandedDepError,
 } from "../errors.js";
 import { validateDependencyId, validateId } from "../id.js";
@@ -125,6 +126,24 @@ const BD_TO_DEP: Record<string, DepType> = {
   "parent-child": "parent",
   "discovered-from": "discovered-from",
 };
+
+/**
+ * Does `task` reference `id` through ANY edge type the model represents?
+ *
+ * `DepType` spans `blocked-by`, `parent` and `discovered-from`, and `bd delete
+ * --force` (measured on bd 1.3.0) strips the deleted row's edges off its
+ * surviving dependents regardless of type. So every guard whose job is to stop
+ * an edge from being LOST has to ask about all three, not only the blocking
+ * one: a `parent` or `discovered-from` edge carries just as much, and its
+ * reason string even more, since beads itself does not store one.
+ *
+ * Deliberately NOT used by `removeUnlocked`: there the operator asked for the
+ * row to be deleted, so losing its edges is the stated intent, and that guard
+ * exists to protect a BLOCKED dependent rather than an edge in transit.
+ */
+function referencesDep(task: Task, id: string): boolean {
+  return task.deps.some((dep) => dep.id === id);
+}
 
 const NOT_FOUND_MARKERS = ["not found", "no issues found matching"];
 
@@ -949,6 +968,20 @@ export class BeadsStore implements Store {
       .map((task) => task.id);
   }
 
+  /**
+   * Rows this graph still holds that reference `id` through ANY edge type, not
+   * only a blocking one. This is the question a transfer rollback has to ask:
+   * `activeDependents` above answers the narrower "is something BLOCKED by it"
+   * that `rm` needs for its unblock suggestion, and an edge about to be
+   * destroyed by a rollback delete is lost whatever its type.
+   */
+  private async edgeDependents(id: string): Promise<string[]> {
+    const { items } = await this.list({});
+    return items
+      .filter((task) => task.state !== "done" && referencesDep(task, id))
+      .map((task) => task.id);
+  }
+
   // -------------------------------------------------------------------------
   // State + dependencies
   // -------------------------------------------------------------------------
@@ -1389,6 +1422,13 @@ export class BeadsStore implements Store {
   /**
    * The graph-store form of the markdown backend's split-dependency guard: no
    * transfer may leave a dependency edge pointing across the two graphs.
+   *
+   * Side (a) covers EVERY `DepType`, not just `blocked-by`: removing the moved
+   * row from this graph strips the edge off whatever stayed behind, and that is
+   * a loss for a `parent` or `discovered-from` edge exactly as much as for a
+   * blocking one. A blocking dependent is still named with the established
+   * "still blocking" wording; the non-blocking types get their own, because
+   * nothing about them is blocked.
    */
   private async requireNoSplitDeps(
     destination: BeadsStore,
@@ -1397,15 +1437,30 @@ export class BeadsStore implements Store {
   ): Promise<void> {
     const { items } = await this.list({});
     for (const id of moved) {
-      const stranded = items
-        .filter(
-          (task) =>
-            !moved.has(task.id) &&
-            task.state !== "done" &&
-            task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
-        )
-        .map((task) => task.id);
-      if (stranded.length > 0) throw stillBlockingError(id, stranded);
+      const dependents = items.filter(
+        (task) =>
+          !moved.has(task.id) &&
+          task.state !== "done" &&
+          referencesDep(task, id),
+      );
+      if (dependents.length === 0) continue;
+      const blocking = dependents.filter((task) =>
+        task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
+      );
+      if (blocking.length > 0) {
+        throw stillBlockingError(
+          id,
+          blocking.map((task) => task.id),
+        );
+      }
+      throw strandedDependentError(
+        id,
+        dependents.map((task) => ({
+          id: task.id,
+          // Non-empty by construction: `dependents` was filtered on it.
+          type: task.deps.find((dep) => dep.id === id)!.type,
+        })),
+      );
     }
     for (const task of tasks) {
       for (const dep of task.deps) {
@@ -1425,11 +1480,12 @@ export class BeadsStore implements Store {
    *    An unread result would report a clean undo while leaving the task in
    *    both graphs.
    *  - `held`: removing the row would have stripped a dependency edge off a
-   *    dependent this graph still holds. Measured on bd 1.3.0, `bd delete
-   *    --force` deletes a row that still has dependents and silently drops
-   *    their edges — the same trap `removeUnlocked` guards against — and a
-   *    transfer that loses an edge and its reason is NOT recoverable by
-   *    retrying the id that failed. So the row is kept and named instead.
+   *    dependent this graph still holds, of ANY type the model represents.
+   *    Measured on bd 1.3.0, `bd delete --force` deletes a row that still has
+   *    dependents and silently drops their edges whatever the edge type — the
+   *    same trap `removeUnlocked` guards against — and a transfer that loses an
+   *    edge and its reason is NOT recoverable by retrying the id that failed.
+   *    So the row is kept and named instead.
    *
    * Dependents are discarded before their blockers, so a row is only ever held
    * for a dependent that is not itself part of this rollback.
@@ -1438,7 +1494,7 @@ export class BeadsStore implements Store {
     const stuck: string[] = [];
     const held: string[] = [];
     for (const id of await this.discardOrder(staged)) {
-      if ((await this.activeDependents(id)).length > 0) {
+      if ((await this.edgeDependents(id)).length > 0) {
         held.push(id);
         continue;
       }
@@ -1463,7 +1519,13 @@ export class BeadsStore implements Store {
 
   /**
    * Dependents before blockers, so removing the set never asks the graph to
-   * drop a row something still active depends on.
+   * drop a row something still in the set references.
+   *
+   * Ordering is load-bearing on the FAILURE path, and for every edge type: if
+   * an endpoint is deleted first and a later removal in the set fails, the row
+   * left behind in this graph has already had its edge to that endpoint
+   * stripped, and no retry restores it. So "references" here spans all of
+   * `DepType`, not just `blocked-by`.
    */
   private removalOrder(tasks: Task[]): Task[] {
     const ordered: Task[] = [];
@@ -1472,10 +1534,7 @@ export class BeadsStore implements Store {
       if (seen.has(task.id)) return;
       seen.add(task.id);
       for (const other of tasks) {
-        const dependsOnTask = other.deps.some(
-          (dep) => dep.type === "blocked-by" && dep.id === task.id,
-        );
-        if (dependsOnTask) visit(other);
+        if (referencesDep(other, task.id)) visit(other);
       }
       ordered.push(task);
     };
