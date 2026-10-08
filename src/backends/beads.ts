@@ -1293,11 +1293,15 @@ export class BeadsStore implements Store {
         movedOnly.push(task.id);
         continue;
       }
+      // Captured BEFORE the rollback: `discardStaged` runs more removals, and
+      // when the destination is this same graph they would overwrite the
+      // detail that explains the failure being reported.
+      const detail = this.lastRemovalDetail;
       const rollback = staged.filter((id) => !movedOnly.includes(id));
       const stuck = await destination.discardStaged(rollback);
       throw splitTransferError({
         failed: task.id,
-        detail: this.lastRemovalDetail,
+        detail,
         source: this.beadsDir,
         destination: destination.beadsDir,
         movedOnly,
