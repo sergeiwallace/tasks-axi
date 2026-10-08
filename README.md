@@ -249,13 +249,43 @@ Body replacements with `--archive-body` append superseded bodies to `note-archiv
 
 ## Backends
 
-P1 ships the **markdown** backend only, behind a narrow `Store` interface so additional backends slot in without touching the CLI layer.
+Backends sit behind a narrow `Store` interface, so they slot in without touching the CLI layer.
 
 | Backend                | Status  |
 | ---------------------- | ------- |
 | markdown               | shipped |
+| beads                  | shipped |
 | sqlite                 | planned |
 | github / jira / linear | planned |
+
+### The beads backend
+
+`backend = "beads"` stores the backlog in a [beads](https://github.com/gastownhall/beads) issue database, driven through the `bd` CLI (`npm install -g @beads/bd`, then `bd init` in the workspace directory).
+Beads becomes the source of truth: dependency graph, priorities, full history, and every bd-native view (`bd show`, `bd graph`, `bd list`) work on the same tasks.
+
+```toml
+# .tasks.toml
+backend = "beads"
+
+[beads]
+path = ".beads"            # the .beads directory itself (default: ./.beads)
+binary = "bd"              # optional bd binary override
+prefix = "AIH"             # optional: resolve a bare id against this graph prefix
+```
+
+**The graph is the sole record.** Nothing mirrors it into a markdown backlog: there is no mirror file, no `note-archive.md` write and no markdown archive, and an unresolvable graph raises a structured error naming the path rather than falling back to a `.md` file.
+`[beads] path` names the `.beads` directory; the adapter addresses it as `bd -C <its parent>`, which works from any cwd and from a linked git worktree. PR #52's `dir` / `bin` keys are still accepted as deprecated aliases (`dir` named the directory *holding* `.beads`).
+tasks-axi fields that beads has no column for (kind, repo, holds, canonical dates, dependency reasons, public obligations) live in flat `axi.*` metadata keys. Every mutation sends all owned keys in **one** `bd` call, using an explicit JSON `null` as a tombstone, because bd refuses to combine `--metadata` with `--unset-metadata` — so a hold or a delivery is never observable half-written.
+`--archive-body` keeps the superseded body inside Beads, appended to an `axi.body_archive` history rather than to a file.
+`reopen` keeps the original completion stamp: `bd update -s open` clears bd's own `closed_at` *and* `close_reason`, so the durable stamp lives in `axi.closed` and is carried through explicitly.
+`remove` refuses a task that still blocks active work. bd's own `delete --force` would delete it and silently drop the dependents' edges despite its help claiming otherwise, so the guard lives in the adapter, before the delete.
+`ready`/`blocked`/`held` stay derived by the CLI from the dependency graph, so they are correct even where `bd ready` itself is not.
+`prune` and `render` are **not** offered (`capabilities().prune` is false): both would mean inventing an archive or an export file beside an authoritative graph, so the CLI names the missing capability instead.
+Public-followups **are** supported: the whole typed obligation is one base64url payload in `axi.public_followup`, so a revision bump and an atomic completion travel in a single write.
+`mv` moves a connected set between two Beads graphs through the `collectionTransfer` capability — `--to` names another repository holding a `.beads` directory (or that directory itself). Crossing record types is refused by name in both directions: a beads graph never exports into a markdown backlog, and a markdown backlog never writes into a graph.
+Unlike the markdown backend's two-file transaction, a graph-to-graph transfer is **not** atomic — two Dolt graphs cannot share one transaction — so it is staged then compensating: destination rows are written first, source rows removed second, and a failure stops there, rolls back what it safely can, and raises a split-move error naming which ids now live in which graph. A set carrying a public-followup obligation is refused outright, because a record that must exist exactly once cannot be left in both.
+A move is also refused before any write if it would split a dependency edge of **any** modelled type (`blocked-by`, `parent`, `discovered-from`) across the two graphs, and a rollback keeps a staged row rather than delete it out from under a dependent that already moved: `bd delete --force` strips the deleted row's edges off its dependents whatever the type, and a lost edge and reason are not recoverable by retrying.
+Dolt synchronization is deliberately outside adapter calls (`capabilities().realtimeSync` is false), so no lifecycle command can fail on the network or on credentials; `BD_NO_REMOTE_ADOPT=1` and `BD_EXPORT_GIT_ADD=false` are set on every invocation so bd neither adopts a remote into tracked config nor stages its own export.
 
 ## Development
 

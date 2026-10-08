@@ -12,17 +12,42 @@ import { AxiError } from "./errors.js";
  *   ~/.tasks-axi/config.toml > defaults (markdown, first existing
  *   backlog.md/data/backlog.md, otherwise backlog.md).
  *
- * P1 ships only the markdown backend; the Store seam keeps sqlite/remote
+ * The markdown and beads backends ship today; the Store seam keeps further
  * additions invisible to the CLI layer.
  */
 
 export interface ResolvedConfig {
   backend: string;
-  /** Markdown backlog path (resolved to an absolute path). */
+  /**
+   * Markdown backlog path (resolved to an absolute path). The beads backend
+   * does not use it: a Beads home is addressed by `beads.path` alone and
+   * never mirrors itself into a markdown backlog.
+   */
   path: string;
   /** Optional archive path for pruned tasks (resolved to an absolute path). */
   archivePath?: string;
   doneKeep: number;
+  /** Beads graph selection, resolved whatever the active backend. */
+  beads: ResolvedBeadsConfig;
+}
+
+/**
+ * Beads adapter selection. `path` is the `.beads` directory of the owning
+ * repository; the Dolt-backed store inside it stays authoritative, so the
+ * adapter addresses it through the `bd` CLI and never reads or writes an
+ * export file.
+ *
+ * A non-markdown adapter is addressed by this root alone — `--file` /
+ * `TASKS_AXI_FILE` select a markdown backlog and deliberately do not move a
+ * Beads graph.
+ */
+export interface ResolvedBeadsConfig {
+  /** The `.beads` directory (resolved to an absolute path). */
+  path: string;
+  /** The `bd` binary to shell out to. */
+  binary: string;
+  /** Issue prefix of the graph, when the home pins one. */
+  prefix?: string;
 }
 
 export interface ConfigOverrides {
@@ -40,15 +65,28 @@ interface TomlConfig {
     archive?: string;
     done_keep?: number;
   };
+  beads?: {
+    path?: string;
+    binary?: string;
+    prefix?: string;
+    /** Deprecated alias for `path`'s parent: `dir`/.beads. */
+    dir?: string;
+    /** Deprecated alias for `binary`. */
+    bin?: string;
+  };
 }
 
 const DEFAULT_KEEP = 10;
+const DEFAULT_BEADS_DIR = ".beads";
+const DEFAULT_BEADS_BINARY = "bd";
 const PATH_CANDIDATES = ["backlog.md", "data/backlog.md"];
-type ConfigTable = "root" | "markdown" | "unsupported";
+type ConfigTable = "root" | "markdown" | "beads" | "unsupported";
 
 /**
  * Minimal TOML reader for the tiny config surface we need: a top-level
- * `backend` key and a `[markdown]` table with `path` / `archive` / `done_keep`.
+ * `backend` key, a `[markdown]` table with `path` / `archive` / `done_keep`,
+ * and a `[beads]` table with `path` / `binary` / `prefix` (accepting PR #52's
+ * `dir` / `bin` as deprecated aliases).
  * `archive` points at the file that receives pruned tasks.
  * Intentionally not a general TOML parser.
  */
@@ -62,7 +100,8 @@ export function parseConfigToml(src: string): TomlConfig {
 
     const section = line.match(/^\[([^\]]+)\]$/);
     if (section) {
-      table = section[1].trim() === "markdown" ? "markdown" : "unsupported";
+      const name = section[1].trim();
+      table = name === "markdown" || name === "beads" ? name : "unsupported";
       continue;
     }
 
@@ -83,6 +122,17 @@ export function parseConfigToml(src: string): TomlConfig {
 
     if (table === "root") {
       config.backend = requireTomlString(value, source);
+      continue;
+    }
+    if (table === "beads") {
+      config.beads ??= {};
+      if (key === "path") config.beads.path = requireTomlString(value, source);
+      if (key === "binary")
+        config.beads.binary = requireTomlString(value, source);
+      if (key === "prefix")
+        config.beads.prefix = requireTomlString(value, source);
+      if (key === "dir") config.beads.dir = requireTomlString(value, source);
+      if (key === "bin") config.beads.bin = requireTomlString(value, source);
       continue;
     }
     config.markdown ??= {};
@@ -121,16 +171,23 @@ function stripTomlComment(raw: string): string {
   return raw;
 }
 
-function configKeySource(
-  table: ConfigTable,
-  key: string,
-): string | undefined {
+function configKeySource(table: ConfigTable, key: string): string | undefined {
   if (table === "root" && key === "backend") return "backend";
   if (
     table === "markdown" &&
     (key === "path" || key === "archive" || key === "done_keep")
   ) {
     return `markdown.${key}`;
+  }
+  if (
+    table === "beads" &&
+    (key === "path" ||
+      key === "binary" ||
+      key === "prefix" ||
+      key === "dir" ||
+      key === "bin")
+  ) {
+    return `beads.${key}`;
   }
   return undefined;
 }
@@ -240,9 +297,55 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
       DEFAULT_KEEP,
   );
 
-  const config: ResolvedConfig = { backend, path, doneKeep };
+  const config: ResolvedConfig = {
+    backend,
+    path,
+    doneKeep,
+    beads: resolveBeadsConfig(projectToml, homeToml, cwd),
+  };
   if (archive) {
     config.archivePath = isAbsolute(archive) ? archive : resolve(cwd, archive);
   }
   return config;
+}
+
+/**
+ * Resolve the `[beads]` table. `path` names the `.beads` directory itself,
+ * which is the shape Firstmate documents and the shape the adapter's contract
+ * tests assert. PR #52's `dir` / `bin` are accepted as deprecated aliases:
+ * `dir` named the WORKSPACE directory holding `.beads`, so it contributes
+ * `<dir>/.beads` and never wins over an explicit `path`.
+ */
+function resolveBeadsConfig(
+  projectToml: TomlConfig,
+  homeToml: TomlConfig,
+  cwd: string,
+): ResolvedBeadsConfig {
+  const tomlPath =
+    validatePathValue(projectToml.beads?.path, "beads.path") ??
+    validatePathValue(homeToml.beads?.path, "beads.path");
+  const aliasDir =
+    validatePathValue(projectToml.beads?.dir, "beads.dir") ??
+    validatePathValue(homeToml.beads?.dir, "beads.dir");
+  const binary =
+    validatePathValue(projectToml.beads?.binary, "beads.binary") ??
+    validatePathValue(homeToml.beads?.binary, "beads.binary") ??
+    validatePathValue(projectToml.beads?.bin, "beads.bin") ??
+    validatePathValue(homeToml.beads?.bin, "beads.bin") ??
+    DEFAULT_BEADS_BINARY;
+  const prefix =
+    validatePathValue(projectToml.beads?.prefix, "beads.prefix") ??
+    validatePathValue(homeToml.beads?.prefix, "beads.prefix");
+
+  const selected =
+    tomlPath ??
+    (aliasDir !== undefined
+      ? join(aliasDir, DEFAULT_BEADS_DIR)
+      : DEFAULT_BEADS_DIR);
+  const beads: ResolvedBeadsConfig = {
+    path: isAbsolute(selected) ? selected : resolve(cwd, selected),
+    binary,
+  };
+  if (prefix !== undefined) beads.prefix = prefix;
+  return beads;
 }

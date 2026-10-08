@@ -6,11 +6,15 @@ import {
   unlinkSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { AxiError } from "../errors.js";
+import {
+  AxiError,
+  partialMoveError,
+  stillBlockingError,
+  strandedDepError,
+} from "../errors.js";
 import { validateDependencyId, validateId } from "../id.js";
 import type {
   Dep,
-  Hold,
   State,
   Task,
   TaskInput,
@@ -21,14 +25,11 @@ import type {
   TaskUpdateResult,
   TransitionOpts,
 } from "../model.js";
-import { HOLD_KINDS } from "../model.js";
-import { PR_URL_EXPECTED } from "../pr-url.js";
 import {
   PUBLIC_FOLLOWUP_KIND,
   assertPublicFollowupMutation,
   assertPublicFollowupTaskState,
   canonicalEqual,
-  clonePublicFollowup,
   isPublicFollowupTask,
   isPublicFollowupTerminal,
   normalizePublicFollowup,
@@ -47,11 +48,24 @@ import {
   type Section,
   type TaskEntry,
   deriveLinks,
-  extractTags,
   parseBacklog,
   renderBacklog,
   renderTaskLines,
 } from "./markdown-grammar.js";
+import {
+  addBodyLine,
+  appendTitleLink,
+  bodyHasLine,
+  normalizeDate,
+  normalizeDep,
+  normalizeHold,
+  normalizePriority,
+  normalizeTagValue,
+  normalizeTitle,
+  sameHold,
+  sameMeta,
+  taskToInput,
+} from "./normalize.js";
 
 export interface MarkdownStoreOptions {
   path: string;
@@ -69,9 +83,6 @@ const HEADERS: Record<State, string> = {
   queued: "## Queued",
   done: "## Done",
 };
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const DEP_REASON_EDGE_MARKER_RE =
-  /(?:^|\s)(?:blocked-by|parent|discovered-from):\s/;
 
 interface LoadedBacklogDoc {
   doc: BacklogDoc;
@@ -95,210 +106,6 @@ function errno(error: unknown): string {
   return error && typeof error === "object" && "code" in error
     ? String((error as NodeJS.ErrnoException).code)
     : "UNKNOWN";
-}
-
-function normalizeTitle(title: string): string {
-  if (/[\r\n]/.test(title)) {
-    throw new AxiError("Task title must be a single line", "VALIDATION_ERROR");
-  }
-  const trimmed = title.trim();
-  if (trimmed === "") {
-    throw new AxiError("Task title must not be empty", "VALIDATION_ERROR");
-  }
-  if (extractTags(trimmed).title !== trimmed) {
-    throw new AxiError(
-      "Task title must not end with canonical task tags",
-      "VALIDATION_ERROR",
-    );
-  }
-  return trimmed;
-}
-
-function normalizeTagValue(
-  value: string | undefined,
-  field: "kind" | "repo",
-): string | undefined {
-  if (value === undefined) return undefined;
-  if (/[()\r\n]/.test(value)) {
-    throw new AxiError(
-      `Task ${field} must be a single line without parentheses`,
-      "VALIDATION_ERROR",
-    );
-  }
-  const trimmed = value.trim();
-  return trimmed === "" ? undefined : trimmed;
-}
-
-function normalizeLinkUrl(url: string): string {
-  if (/[\r\n]/.test(url)) {
-    throw new AxiError("Task link must be a single line", "VALIDATION_ERROR");
-  }
-  const trimmed = url.trim();
-  if (trimmed === "") {
-    throw new AxiError("Task link must not be empty", "VALIDATION_ERROR");
-  }
-  return trimmed;
-}
-
-function normalizeTypedLink(link: TaskLink): TaskLink {
-  const normalized = normalizeLinkUrl(link.url);
-  // pr URLs must already be canonical; padded input is rejected, not trimmed
-  const url = link.kind === "pr" ? link.url : normalized;
-  const derived = deriveLinks(url);
-  if (
-    !derived.some(
-      (candidate) => candidate.kind === link.kind && candidate.url === url,
-    )
-  ) {
-    const expected =
-      link.kind === "pr"
-        ? PR_URL_EXPECTED
-        : link.kind === "report"
-          ? "a data/<id>/report.md path"
-          : "an http(s) URL";
-    throw new AxiError(
-      `Task ${link.kind} link must be ${expected}`,
-      "VALIDATION_ERROR",
-    );
-  }
-  return { kind: link.kind, url };
-}
-
-function normalizePriority(priority: number | undefined): number | undefined {
-  if (priority === undefined) return undefined;
-  if (!Number.isInteger(priority) || priority < 0 || priority > 4) {
-    throw new AxiError(
-      "Task priority must be an integer 0-4",
-      "VALIDATION_ERROR",
-    );
-  }
-  return priority;
-}
-
-function normalizeHold(hold: Hold | undefined): Hold | undefined {
-  if (hold === undefined) return undefined;
-  if (/[\r\n()]/.test(hold.reason)) {
-    throw new AxiError(
-      "Task hold reason must be a single line without parentheses",
-      "VALIDATION_ERROR",
-    );
-  }
-  const reason = hold.reason.trim();
-  if (reason === "") {
-    throw new AxiError(
-      "Task hold reason must not be empty",
-      "VALIDATION_ERROR",
-    );
-  }
-  const normalized: Hold = { reason };
-  if (hold.kind !== undefined) {
-    if (!(HOLD_KINDS as readonly string[]).includes(hold.kind)) {
-      throw new AxiError(
-        `Task hold kind must be one of ${HOLD_KINDS.join(", ")}`,
-        "VALIDATION_ERROR",
-      );
-    }
-    normalized.kind = hold.kind;
-  }
-  if (hold.until !== undefined) {
-    normalized.until = normalizeDate(hold.until, "hold-until date");
-  }
-  return normalized;
-}
-
-function normalizeDate(value: string, field: string): string {
-  if (!DATE_RE.test(value)) {
-    throw new AxiError(`Task ${field} must be YYYY-MM-DD`, "VALIDATION_ERROR");
-  }
-  return value;
-}
-
-function normalizeDepReason(reason: string | undefined): string | undefined {
-  if (reason === undefined) return undefined;
-  if (/[\r\n]/.test(reason)) {
-    throw new AxiError(
-      "Task dependency reason must be a single line",
-      "VALIDATION_ERROR",
-    );
-  }
-  const trimmed = reason.trim();
-  if (DEP_REASON_EDGE_MARKER_RE.test(trimmed)) {
-    throw new AxiError(
-      "Task dependency reason must not contain dependency markers",
-      "VALIDATION_ERROR",
-    );
-  }
-  return trimmed === "" ? undefined : trimmed;
-}
-
-function normalizeDep(ownerId: string, dep: Dep): Dep {
-  const reason = normalizeDepReason(dep.reason);
-  const checked: Dep = { ...dep, id: validateDependencyId(dep.id) };
-  if (reason === undefined) {
-    delete checked.reason;
-  } else {
-    checked.reason = reason;
-  }
-  if (checked.id === ownerId) {
-    throw new AxiError("A task cannot block itself", "VALIDATION_ERROR");
-  }
-  return checked;
-}
-
-function appendTitleLink(title: string, link: TaskLink): string {
-  const { url } = normalizeTypedLink(link);
-  if (deriveLinks(title).some((link) => link.url === url)) return title;
-  return normalizeTitle(`${title} ${url}`);
-}
-
-function bodyHasLine(body: string | undefined, line: string): boolean {
-  return body?.split("\n").includes(line) ?? false;
-}
-
-function addBodyLine(body: string | undefined, line: string): string {
-  return body ? `${body}\n${line}` : line;
-}
-
-function sameHold(left: Hold | undefined, right: Hold | undefined): boolean {
-  return (
-    left?.reason === right?.reason &&
-    left?.kind === right?.kind &&
-    left?.until === right?.until
-  );
-}
-
-function sameMeta(
-  left: Record<string, unknown> | undefined,
-  right: Record<string, unknown> | undefined,
-): boolean {
-  const leftKeys = Object.keys(left ?? {});
-  const rightKeys = Object.keys(right ?? {});
-  return (
-    leftKeys.length === rightKeys.length &&
-    leftKeys.every((key) => Object.is(left?.[key], right?.[key]))
-  );
-}
-
-function taskToInput(task: Task): TaskInput {
-  const input: TaskInput = {
-    id: task.id,
-    title: task.title,
-    state: task.state,
-    deps: task.deps.map((dep) => ({ ...dep })),
-    links: task.links.map((link) => ({ ...link })),
-  };
-  if (task.kind) input.kind = task.kind;
-  if (task.repo) input.repo = task.repo;
-  if (task.body) input.body = task.body;
-  if (task.hold) input.hold = { ...task.hold };
-  if (task.priority !== undefined) input.priority = task.priority;
-  input.created = task.created ?? null;
-  if (task.closed) input.closed = task.closed;
-  if (task.public_followup) {
-    input.public_followup = clonePublicFollowup(task.public_followup);
-  }
-  if (task.meta) input.meta = { ...task.meta };
-  return input;
 }
 
 export class MarkdownStore implements Store {
@@ -338,6 +145,7 @@ export class MarkdownStore implements Store {
       realtimeSync: false,
       customStates: true,
       serverMintsIds: false,
+      collectionTransfer: true,
       publicFollowups: true,
     };
   }
@@ -498,30 +306,6 @@ export class MarkdownStore implements Store {
     if (!found) return;
     found.section.entries.splice(found.index, 1);
     this.persist(loaded);
-  }
-
-  private partialMoveError(
-    id: string,
-    originalError: unknown,
-    rollbackError: unknown,
-  ): AxiError {
-    const originalMessage =
-      originalError instanceof Error
-        ? originalError.message
-        : String(originalError);
-    const rollbackMessage =
-      rollbackError instanceof Error
-        ? rollbackError.message
-        : String(rollbackError);
-    return new AxiError(
-      `Move of "${id}" partially completed; task now exists in both backlogs`,
-      "CONFLICT",
-      [
-        "Remove the duplicate from the destination backlog manually before retrying",
-        `Source removal failed: ${originalMessage}`,
-        `Destination rollback failed: ${rollbackMessage}`,
-      ],
-    );
   }
 
   private taskFromInput(input: TaskInput): Task {
@@ -812,6 +596,22 @@ export class MarkdownStore implements Store {
   }
 
   /**
+   * `Store.transferMany`. A markdown backlog can only be moved into another
+   * markdown backlog, because the all-or-nothing guarantee comes from locking
+   * both files at once; any other destination is refused before a write rather
+   * than degraded into a copy-then-remove that could strand a dependency edge.
+   */
+  async transferMany(ids: string[], destination: Store): Promise<Task[]> {
+    if (!(destination instanceof MarkdownStore)) {
+      throw new AxiError(
+        `The markdown backend can only transfer tasks into another markdown backlog, not "${destination.capabilities().backend}"`,
+        "UNSUPPORTED",
+      );
+    }
+    return this.moveManyTo(ids, destination);
+  }
+
+  /**
    * Move a connected set of tasks to another backlog in one transaction: either
    * every task lands in the destination and leaves the source, or none do (no
    * intermediate state that loses a link is ever written to disk). Each moved
@@ -876,11 +676,7 @@ export class MarkdownStore implements Store {
         try {
           for (const id of uniqueIds) target.removeCreatedTask(id);
         } catch (rollbackError) {
-          throw this.partialMoveError(
-            uniqueIds.join(", "),
-            error,
-            rollbackError,
-          );
+          throw partialMoveError(uniqueIds.join(", "), error, rollbackError);
         }
         throw error;
       }
@@ -916,15 +712,7 @@ export class MarkdownStore implements Store {
             task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
         )
         .map((task) => task.id);
-      if (stranded.length > 0) {
-        throw new AxiError(
-          `Task "${id}" is still blocking active tasks: ${stranded.join(", ")}`,
-          "VALIDATION_ERROR",
-          [
-            `Move them together, or unblock them first, e.g. \`tasks-axi unblock ${stranded[0]} --by ${id}\``,
-          ],
-        );
-      }
+      if (stranded.length > 0) throw stillBlockingError(id, stranded);
     }
 
     // (b) A moved item's blocker must travel with it or already exist in the
@@ -937,14 +725,7 @@ export class MarkdownStore implements Store {
       for (const dep of found.entry.task.deps) {
         if (movedSet.has(dep.id)) continue;
         if (this.findEntry(targetDoc, dep.id)) continue;
-        const label = dep.type === "blocked-by" ? "blocker" : "dependency";
-        throw new AxiError(
-          `Cannot move "${id}": its ${label} "${dep.id}" would be stranded (not in the moved set and absent from the destination)`,
-          "VALIDATION_ERROR",
-          [
-            `Add "${dep.id}" to the same \`mv\`, or move it to the destination first`,
-          ],
-        );
+        throw strandedDepError(id, dep);
       }
     }
   }

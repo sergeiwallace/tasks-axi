@@ -1,6 +1,5 @@
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
-import { MarkdownStore } from "../backends/markdown.js";
 import {
   parseNonNegativeIntegerFlag,
   requireNoUnknownFlags,
@@ -12,14 +11,22 @@ import {
   takeFlag,
 } from "../args.js";
 import { renderMutation, stateLabel, taskToJson } from "../confirm.js";
-import { requireCtx, type TasksContext } from "../context.js";
+import { taskToInput } from "../backends/normalize.js";
+import type { ResolvedConfig } from "../config.js";
+import { createStore, requireCtx, type TasksContext } from "../context.js";
 import {
   blockedIds,
   heldTasks,
   readyPublicFollowups,
   readyTasks,
 } from "../derive.js";
-import { AxiError, notFound } from "../errors.js";
+import {
+  AxiError,
+  notFound,
+  partialMoveError,
+  stillBlockingError,
+  strandedDepError,
+} from "../errors.js";
 import { formatCountLine } from "../format.js";
 import { validateDependencyId } from "../id.js";
 import type {
@@ -27,15 +34,11 @@ import type {
   Hold,
   HoldKind,
   Task,
-  TaskInput,
   TaskLink,
   TaskPatch,
 } from "../model.js";
 import { HOLD_KINDS } from "../model.js";
-import {
-  PUBLIC_FOLLOWUP_KIND,
-  clonePublicFollowup,
-} from "../public-followup.js";
+import { PUBLIC_FOLLOWUP_KIND } from "../public-followup.js";
 import type { Store } from "../store.js";
 import { getSuggestions } from "../suggestions.js";
 import { renderHelp, renderOutput } from "../toon.js";
@@ -100,18 +103,34 @@ Public-followup obligations are never dispatchable and appear only in the separa
 ready_public_followups group; use tasks-axi public-followup ready for their full payloads.
 Held work is excluded by default; --include-held shows it in a separate held group.`;
 
+/** The graph directory name a beads `--to` destination is resolved against. */
+const BEADS_DIR = ".beads";
+
 export const MV_HELP = `usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>
-Move one or more tasks to another backlog file in a single atomic transaction.
+Move one or more tasks to another backlog.
 Pass a whole connected set (a blocker and its dependents) to move it together;
-their blocked-by links and reason strings are preserved byte-exact.
+their dependency links and reason strings are preserved byte-exact.
 Duplicate ids are ignored after their first occurrence.
-Refuses if a moved item's dependency or active dependent would be stranded in the other
-file - include the whole set, or move the missing endpoint there first.
+Refuses if a moved item's dependency or dependent would be stranded in the other
+collection - include the whole set, or move the missing endpoint there first.
+How far the move is atomic depends on the backend:
+  markdown -> markdown  one atomic transaction under a lock on both files:
+                        either every task moves or none does.
+  beads -> beads        NOT atomic - two graphs cannot share a transaction. The
+                        destination rows are staged first, then the source rows
+                        removed; a failure stops there, rolls back what it can
+                        and raises a split-move error naming which ids are now
+                        in which graph. A set carrying a public-followup
+                        obligation is refused outright for that reason.
+  across record kinds   refused in both directions, never exported: --to on a
+                        beads home names another .beads graph (a repository
+                        holding one, or the directory itself).
 flags:
   --json   print the result as a JSON object
 examples:
   tasks-axi mv hibit-cert-cleanup --to ../homemux/data/backlog.md
-  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md`;
+  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md
+  tasks-axi mv blocker-b1 dependent-d2 --to ../other-repo        # beads`;
 
 export async function startCommand(
   rawArgs: string[],
@@ -642,6 +661,168 @@ export async function readyCommand(
   return renderOutput(blocks);
 }
 
+/**
+ * The backend-neutral form of the markdown backend's internal split-dependency
+ * guard, expressed with core Store verbs so the non-atomic transfer path
+ * enforces the same invariant: no move may leave a dependency edge pointing
+ * across the two collections.
+ */
+async function requireNoSplitDeps(
+  source: Store,
+  target: Store,
+  ids: string[],
+  tasks: Task[],
+): Promise<void> {
+  const movedSet = new Set(ids);
+
+  // (a) An active dependent left behind would point at a now-absent blocker.
+  const { items: remaining } = await source.list({});
+  for (const id of ids) {
+    const stranded = remaining
+      .filter(
+        (task) =>
+          !movedSet.has(task.id) &&
+          task.state !== "done" &&
+          task.deps.some((dep) => dep.type === "blocked-by" && dep.id === id),
+      )
+      .map((task) => task.id);
+    if (stranded.length > 0) throw stillBlockingError(id, stranded);
+  }
+
+  // (b) A moved task's own edges must travel with it or already exist there.
+  for (const task of tasks) {
+    for (const dep of task.deps) {
+      if (movedSet.has(dep.id)) continue;
+      if (await target.get(dep.id)) continue;
+      throw strandedDepError(task.id, dep);
+    }
+  }
+}
+
+/**
+ * Relocating a durable public obligation is only safe on a backend that can
+ * move it atomically, so a copy-then-remove fallback declines outright rather
+ * than half-moving it or failing confusingly mid-write. The atomic path carries
+ * obligations happily because it never has a half-applied state to fall into.
+ */
+function requireNoPublicObligation(task: Task, backend: string): void {
+  if (!task.public_followup) return;
+  throw new AxiError(
+    `Task "${task.id}" carries a public obligation, which the "${backend}" backend cannot relocate safely without the atomic collectionTransfer capability. Closing the obligation out does not lift this: the refusal follows from the backend, not from the delivery state`,
+    "VALIDATION_ERROR",
+    [
+      `Run the move against a backend that supports collectionTransfer`,
+      `Or recreate the obligation in the destination deliberately (\`tasks-axi public-followup add --help\`) and close the original`,
+    ],
+  );
+}
+
+/**
+ * Undo the destination copy a non-atomic transfer already wrote, after the
+ * source removal was refused. Compensating here keeps both collections exactly
+ * as they were, which the reverse order (remove first) could not: that would
+ * trade a duplicate for a lost task. This is the backstop for backend-specific
+ * preconditions the command layer cannot see on the model; if the compensation
+ * itself fails the operator is told about both the refusal and the copy left
+ * behind.
+ */
+async function undoStagedCopy(
+  target: Store,
+  id: string,
+  targetPath: string,
+  cause: unknown,
+): Promise<never> {
+  try {
+    await target.remove(id);
+  } catch (rollbackError) {
+    throw partialMoveError(id, cause, rollbackError, targetPath);
+  }
+  throw cause;
+}
+
+/**
+ * What `--to` denotes depends on the active backend, so the destination is
+ * resolved against it rather than assumed to be a markdown file.
+ *
+ * For a beads home it names ANOTHER `.beads` graph — the narrowest reading
+ * that keeps Beads the sole record. Crossing the two record types is refused
+ * in both directions and by name: moving out of a graph into a markdown
+ * backlog would export the task out of the authoritative store, and moving a
+ * markdown task into a graph would silently change which store owns it.
+ */
+function resolveMoveDestination(
+  config: ResolvedConfig,
+  to: string,
+): { config: ResolvedConfig; path: string; current: string } {
+  const base = isAbsolute(to) ? to : resolve(process.cwd(), to);
+
+  if (config.backend === "beads") {
+    if (base.endsWith(".md")) throw crossRecordMoveError(to, "beads");
+    const graph = beadsGraphAt(base);
+    if (!existsSync(graph) || !statSync(graph).isDirectory()) {
+      throw new AxiError(
+        `--to "${to}" does not name a beads graph`,
+        "VALIDATION_ERROR",
+        [
+          `Point --to at a repository holding a ${BEADS_DIR} directory, or at the ${BEADS_DIR} directory itself`,
+          "There is no markdown fallback for the beads backend",
+        ],
+      );
+    }
+    return {
+      config: { ...config, beads: { ...config.beads, path: graph } },
+      path: graph,
+      current: config.beads.path,
+    };
+  }
+
+  if (isBeadsGraphPath(base)) throw crossRecordMoveError(to, "markdown");
+  const path = resolveBacklogTarget(to);
+  return {
+    config: { backend: config.backend, path, doneKeep: config.doneKeep, beads: config.beads },
+    path,
+    current: config.path,
+  };
+}
+
+/**
+ * Which path a `--to` of `path` names if it names a beads graph at all — the
+ * `.beads` directory itself, or the one inside a repository directory. This is
+ * the SAME rule the config resolver applies when selecting the source graph
+ * (`[beads] dir` resolves to `<dir>/.beads`).
+ */
+function beadsGraphAt(path: string): string {
+  return basename(path) === BEADS_DIR ? path : resolve(path, BEADS_DIR);
+}
+
+/**
+ * Does `--to` denote a beads graph? Both directions of the cross-record
+ * refusal must agree on the answer, so it is answered in one place. A
+ * repository directory HOLDING a graph counts: reading only the final path
+ * segment let `--to ../other-repo` fall through to `data/backlog.md` and
+ * export a graph task into a markdown file — the one thing the two-way
+ * refusal exists to prevent. A path literally named `.beads` is refused on its
+ * name alone, whether or not it exists yet, so the refusal does not depend on
+ * when the directory was created.
+ */
+function isBeadsGraphPath(path: string): boolean {
+  if (basename(path) === BEADS_DIR) return true;
+  const graph = beadsGraphAt(path);
+  return existsSync(graph) && statSync(graph).isDirectory();
+}
+
+function crossRecordMoveError(to: string, backend: string): AxiError {
+  return new AxiError(
+    `--to "${to}" names a ${backend === "beads" ? "markdown backlog" : "beads graph"}, which the "${backend}" backend cannot move tasks into: the two keep separate records and a move across them would change which store owns the task`,
+    "UNSUPPORTED",
+    [
+      backend === "beads"
+        ? `Name another ${BEADS_DIR} graph, e.g. \`--to ../other-repo\``
+        : "Name another markdown backlog, e.g. `--to ../other/data/backlog.md`",
+    ],
+  );
+}
+
 function resolveBacklogTarget(to: string): string {
   const base = isAbsolute(to) ? to : resolve(process.cwd(), to);
   if (existsSync(base) && statSync(base).isDirectory()) {
@@ -652,28 +833,6 @@ function resolveBacklogTarget(to: string): string {
     return resolve(base, "data/backlog.md");
   }
   return base;
-}
-
-function taskToInput(task: Task): TaskInput {
-  const input: TaskInput = {
-    id: task.id,
-    title: task.title,
-    state: task.state,
-    deps: task.deps.map((dep) => ({ ...dep })),
-    links: task.links.map((link) => ({ ...link })),
-  };
-  if (task.kind) input.kind = task.kind;
-  if (task.repo) input.repo = task.repo;
-  if (task.body) input.body = task.body;
-  if (task.hold) input.hold = { ...task.hold };
-  if (task.priority !== undefined) input.priority = task.priority;
-  input.created = task.created ?? null;
-  if (task.closed) input.closed = task.closed;
-  if (task.public_followup) {
-    input.public_followup = clonePublicFollowup(task.public_followup);
-  }
-  if (task.meta) input.meta = { ...task.meta };
-  return input;
 }
 
 export async function mvCommand(
@@ -699,8 +858,9 @@ export async function mvCommand(
   }
   const ids = [...new Set(positionals.map((p) => requireId(p, "id")))];
 
-  const targetPath = resolveBacklogTarget(to);
-  if (resolve(targetPath) === resolve(config.path)) {
+  const destination = resolveMoveDestination(config, to);
+  const targetPath = destination.path;
+  if (resolve(targetPath) === resolve(destination.current)) {
     throw new AxiError(
       "--to resolves to the current backlog",
       "VALIDATION_ERROR",
@@ -714,7 +874,7 @@ export async function mvCommand(
     tasks.push(task);
   }
 
-  const target = new MarkdownStore({ path: targetPath });
+  const target = createStore(destination.config);
   for (const id of ids) {
     if (await target.get(id)) {
       throw new AxiError(
@@ -724,15 +884,34 @@ export async function mvCommand(
     }
   }
 
-  if (store instanceof MarkdownStore) {
-    await store.moveManyTo(ids, target);
+  const capabilities = store.capabilities();
+  if (capabilities.collectionTransfer) {
+    if (!store.transferMany) {
+      throw new AxiError(
+        `The "${capabilities.backend}" backend declares the collectionTransfer capability but does not implement transferMany`,
+        "UNSUPPORTED",
+      );
+    }
+    await store.transferMany(ids, target);
   } else if (ids.length === 1) {
+    // Without an atomic transfer the copy and the removal are two writes, so a
+    // multi-task move could strand a dependency edge halfway. One task is still
+    // safe to relocate, but only after the same split-dependency check the
+    // atomic path performs internally — otherwise the weaker path would quietly
+    // accept moves the stronger one refuses.
+    await requireNoSplitDeps(store, target, ids, tasks);
+    requireNoPublicObligation(tasks[0], capabilities.backend);
     await target.create(taskToInput(tasks[0]));
-    await store.remove(ids[0]);
+    try {
+      await store.remove(ids[0]);
+    } catch (error) {
+      await undoStagedCopy(target, ids[0], targetPath, error);
+    }
   } else {
     throw new AxiError(
-      "Moving multiple tasks at once requires the markdown backend",
+      `The "${capabilities.backend}" backend cannot move several tasks at once (missing capability: collectionTransfer)`,
       "UNSUPPORTED",
+      [`Move one task at a time: \`tasks-axi mv ${ids[0]} --to ${to}\``],
     );
   }
 
@@ -746,7 +925,7 @@ export async function mvCommand(
       ok: true,
       action: "mv",
       ...(single ? { id: ids[0] } : { ids }),
-      from: config.path,
+      from: destination.current,
       to: targetPath,
     },
     suggestions: getSuggestions({

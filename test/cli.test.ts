@@ -216,6 +216,26 @@ describe("CLI entrypoint", () => {
     expect(c.read()).toContain("usage: tasks-axi done");
   });
 
+  /**
+   * `mv` help has to name BOTH atomicity regimes, because only one of them is a
+   * transaction: markdown moves hold a lock on both files, while a beads
+   * transfer is staged-then-compensating and can raise a split-move error. Help
+   * that promised a single atomic transaction for every move was telling an
+   * operator the one thing the beads path cannot deliver.
+   */
+  it("names both move atomicity regimes in mv help", async () => {
+    const c = capture();
+    await main({ argv: ["mv", "--help"], stdout: c.stdout });
+    const help = c.read();
+    expect(help).toContain("usage: tasks-axi mv");
+    expect(help).toMatch(/markdown -> markdown\s+one atomic transaction/);
+    expect(help).toMatch(/beads -> beads\s+NOT atomic/);
+    expect(help).toContain("split-move error");
+    expect(help).toContain("refused in both directions");
+    // The unqualified promise is gone, not merely qualified somewhere below.
+    expect(help).not.toContain("in a single atomic transaction");
+  });
+
   it("returns focused help for a public-followup subcommand", async () => {
     const c = capture();
     await main({
