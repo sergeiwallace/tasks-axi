@@ -113,11 +113,15 @@ their blocked-by links and reason strings are preserved byte-exact.
 Duplicate ids are ignored after their first occurrence.
 Refuses if a moved item's dependency or active dependent would be stranded in the other
 file - include the whole set, or move the missing endpoint there first.
+On the beads backend --to names another .beads graph (a repository holding one,
+or the directory itself); moving between a graph and a markdown backlog is
+refused in both directions rather than exported.
 flags:
   --json   print the result as a JSON object
 examples:
   tasks-axi mv hibit-cert-cleanup --to ../homemux/data/backlog.md
-  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md`;
+  tasks-axi mv blocker-b1 dependent-d2 --to ../homemux/data/backlog.md
+  tasks-axi mv blocker-b1 dependent-d2 --to ../other-repo        # beads`;
 
 export async function startCommand(
   rawArgs: string[],
