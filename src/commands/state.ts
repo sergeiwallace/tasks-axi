@@ -107,15 +107,24 @@ Held work is excluded by default; --include-held shows it in a separate held gro
 const BEADS_DIR = ".beads";
 
 export const MV_HELP = `usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>
-Move one or more tasks to another backlog file in a single atomic transaction.
+Move one or more tasks to another backlog.
 Pass a whole connected set (a blocker and its dependents) to move it together;
-their blocked-by links and reason strings are preserved byte-exact.
+their dependency links and reason strings are preserved byte-exact.
 Duplicate ids are ignored after their first occurrence.
-Refuses if a moved item's dependency or active dependent would be stranded in the other
-file - include the whole set, or move the missing endpoint there first.
-On the beads backend --to names another .beads graph (a repository holding one,
-or the directory itself); moving between a graph and a markdown backlog is
-refused in both directions rather than exported.
+Refuses if a moved item's dependency or dependent would be stranded in the other
+collection - include the whole set, or move the missing endpoint there first.
+How far the move is atomic depends on the backend:
+  markdown -> markdown  one atomic transaction under a lock on both files:
+                        either every task moves or none does.
+  beads -> beads        NOT atomic - two graphs cannot share a transaction. The
+                        destination rows are staged first, then the source rows
+                        removed; a failure stops there, rolls back what it can
+                        and raises a split-move error naming which ids are now
+                        in which graph. A set carrying a public-followup
+                        obligation is refused outright for that reason.
+  across record kinds   refused in both directions, never exported: --to on a
+                        beads home names another .beads graph (a repository
+                        holding one, or the directory itself).
 flags:
   --json   print the result as a JSON object
 examples:
