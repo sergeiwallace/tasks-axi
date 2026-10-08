@@ -23,6 +23,26 @@ export interface ResolvedConfig {
   /** Optional archive path for pruned tasks (resolved to an absolute path). */
   archivePath?: string;
   doneKeep: number;
+  /** Beads graph selection, resolved whatever the active backend. */
+  beads: ResolvedBeadsConfig;
+}
+
+/**
+ * Beads adapter selection. `path` is the `.beads` directory of the owning
+ * repository; the Dolt-backed store inside it stays authoritative, so the
+ * adapter addresses it through the `bd` CLI and never reads an export file.
+ *
+ * A non-markdown adapter is addressed by this root alone — `--file` /
+ * `TASKS_AXI_FILE` select a markdown backlog and deliberately do not move a
+ * Beads graph.
+ */
+export interface ResolvedBeadsConfig {
+  /** The `.beads` directory (resolved to an absolute path). */
+  path: string;
+  /** The `bd` binary to shell out to. */
+  binary: string;
+  /** Issue prefix of the graph, when the home pins one. */
+  prefix?: string;
 }
 
 export interface ConfigOverrides {
@@ -40,11 +60,18 @@ interface TomlConfig {
     archive?: string;
     done_keep?: number;
   };
+  beads?: {
+    path?: string;
+    binary?: string;
+    prefix?: string;
+  };
 }
 
 const DEFAULT_KEEP = 10;
 const PATH_CANDIDATES = ["backlog.md", "data/backlog.md"];
-type ConfigTable = "root" | "markdown" | "unsupported";
+const DEFAULT_BEADS_DIR = ".beads";
+const DEFAULT_BEADS_BINARY = "bd";
+type ConfigTable = "root" | "markdown" | "beads" | "unsupported";
 
 /**
  * Minimal TOML reader for the tiny config surface we need: a top-level
@@ -62,7 +89,11 @@ export function parseConfigToml(src: string): TomlConfig {
 
     const section = line.match(/^\[([^\]]+)\]$/);
     if (section) {
-      table = section[1].trim() === "markdown" ? "markdown" : "unsupported";
+      const name = section[1].trim();
+      table =
+        name === "markdown" || name === "beads"
+          ? (name as ConfigTable)
+          : "unsupported";
       continue;
     }
 
@@ -83,6 +114,15 @@ export function parseConfigToml(src: string): TomlConfig {
 
     if (table === "root") {
       config.backend = requireTomlString(value, source);
+      continue;
+    }
+    if (table === "beads") {
+      config.beads ??= {};
+      if (key === "path") config.beads.path = requireTomlString(value, source);
+      if (key === "binary")
+        config.beads.binary = requireTomlString(value, source);
+      if (key === "prefix")
+        config.beads.prefix = requireTomlString(value, source);
       continue;
     }
     config.markdown ??= {};
@@ -131,6 +171,12 @@ function configKeySource(
     (key === "path" || key === "archive" || key === "done_keep")
   ) {
     return `markdown.${key}`;
+  }
+  if (
+    table === "beads" &&
+    (key === "path" || key === "binary" || key === "prefix")
+  ) {
+    return `beads.${key}`;
   }
   return undefined;
 }
@@ -240,9 +286,43 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
       DEFAULT_KEEP,
   );
 
-  const config: ResolvedConfig = { backend, path, doneKeep };
+  const config: ResolvedConfig = {
+    backend,
+    path,
+    doneKeep,
+    beads: resolveBeadsConfig(projectToml, homeToml, cwd),
+  };
   if (archive) {
     config.archivePath = isAbsolute(archive) ? archive : resolve(cwd, archive);
   }
   return config;
+}
+
+function resolveBeadsConfig(
+  projectToml: TomlConfig,
+  homeToml: TomlConfig,
+  cwd: string,
+): ResolvedBeadsConfig {
+  const tomlPath =
+    projectToml.beads?.path !== undefined
+      ? validatePathValue(projectToml.beads.path, "beads.path")
+      : validatePathValue(homeToml.beads?.path, "beads.path");
+  const binary =
+    validatePathValue(projectToml.beads?.binary, "beads.binary") ??
+    validatePathValue(homeToml.beads?.binary, "beads.binary") ??
+    DEFAULT_BEADS_BINARY;
+  const prefix =
+    validatePathValue(projectToml.beads?.prefix, "beads.prefix") ??
+    validatePathValue(homeToml.beads?.prefix, "beads.prefix");
+
+  const beads: ResolvedBeadsConfig = {
+    path: tomlPath
+      ? isAbsolute(tomlPath)
+        ? tomlPath
+        : resolve(cwd, tomlPath)
+      : resolve(cwd, DEFAULT_BEADS_DIR),
+    binary,
+  };
+  if (prefix !== undefined) beads.prefix = prefix;
+  return beads;
 }
