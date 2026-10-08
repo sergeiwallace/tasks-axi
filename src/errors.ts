@@ -104,6 +104,12 @@ export interface SplitTransferState {
   returned: string[];
   /** Destination copy could not be rolled back: in BOTH collections. */
   stuck: string[];
+  /**
+   * Destination copy deliberately KEPT, because removing it would have stripped
+   * a dependency edge off a dependent the destination still holds: in BOTH
+   * collections, but by choice rather than by failure.
+   */
+  held: string[];
 }
 
 /**
@@ -116,7 +122,10 @@ export interface SplitTransferState {
  * operator acts on cannot drift between the backends that raise it.
  */
 export function splitTransferError(state: SplitTransferState): AxiError {
-  const split = state.movedOnly.length > 0 || state.stuck.length > 0;
+  const split =
+    state.movedOnly.length > 0 ||
+    state.stuck.length > 0 ||
+    state.held.length > 0;
   const suggestions: string[] = [];
   if (state.movedOnly.length > 0) {
     suggestions.push(
@@ -131,6 +140,11 @@ export function splitTransferError(state: SplitTransferState): AxiError {
   if (state.stuck.length > 0) {
     suggestions.push(
       `In BOTH collections — remove from ${state.destination} by hand: ${state.stuck.join(", ")}`,
+    );
+  }
+  if (state.held.length > 0) {
+    suggestions.push(
+      `In BOTH collections — kept in ${state.destination} on purpose, because deleting them there would have stripped the dependency edges off dependents that already moved: ${state.held.join(", ")}`,
     );
   }
   if (split) {

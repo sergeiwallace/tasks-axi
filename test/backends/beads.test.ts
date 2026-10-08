@@ -1087,13 +1087,62 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore cross-graph mv", () => {
     expect(suggestions).toContain("fi-blocker");
     expect(suggestions).toContain("dolt: table is locked");
 
-    // The id whose removal failed is in exactly ONE graph: its source row was
-    // left intact and its destination copy rolled back.
+    // The id whose removal failed kept its source row. Its destination copy is
+    // KEPT too, not rolled back: `fi-dependent` has already moved, so deleting
+    // its blocker in the destination would strip that dependent's edge for
+    // good. The error says so rather than claiming a clean undo.
     expect((await ctx.store.get("fi-blocker"))?.title).toBe("Lay the cable");
-    expect(await landed.get("fi-blocker")).toBeNull();
-    // The id already removed from the source is in exactly ONE graph too.
+    expect((await landed.get("fi-blocker"))?.title).toBe("Lay the cable");
+    expect(suggestions).toContain("kept in");
+    // The id already removed from the source is in exactly ONE graph.
     expect(await ctx.store.get("fi-dependent")).toBeNull();
     expect((await landed.get("fi-dependent"))?.title).toBe("Light the lamp");
+  });
+
+  it("test_transfer_many_when_rollback_would_strip_a_moved_dependents_edge_then_keeps_the_blocker_and_names_it", async () => {
+    const source = freshGraph();
+    const destination = freshGraph();
+    const ctx = contextFor(source);
+    const landed = contextFor(destination).store;
+
+    await ctx.store.create({ id: "fe-blocker", title: "Lay the cable" });
+    await ctx.store.create({
+      id: "fe-dependent",
+      title: "Light the lamp",
+      deps: [{ type: "blocked-by", id: "fe-blocker", reason: "needs power" }],
+    });
+
+    // Dependents are removed first, so failing the blocker's delete leaves the
+    // dependent in the destination and its blocker staged there beside it.
+    failDeleteOf(ctx.store as BeadsStore, "fe-blocker");
+
+    let error: unknown;
+    try {
+      await mvCommand(
+        ["fe-blocker", "fe-dependent", "--to", destination.repo],
+        ctx,
+      );
+    } catch (caught) {
+      error = caught;
+    }
+    vi.restoreAllMocks();
+
+    expect((error as AxiError).code).toBe("CONFLICT");
+
+    // What recoverability means here: the surviving dependent keeps BOTH its
+    // edge and the reason on it. `bd delete --force` drops a dependent's edge
+    // silently, and no retry of the failed blocker could restore it, so the
+    // rollback must not have deleted the blocker in the destination.
+    expect((await landed.get("fe-dependent"))?.deps).toEqual([
+      { type: "blocked-by", id: "fe-blocker", reason: "needs power" },
+    ]);
+    // Proved against bd itself, not against the adapter that kept the row.
+    expect(rawExists(destination, "fe-blocker")).toBe(true);
+    expect((await ctx.store.get("fe-blocker"))?.title).toBe("Lay the cable");
+
+    const suggestions = (error as AxiError).suggestions.join("\n");
+    expect(suggestions).toContain("kept in");
+    expect(suggestions).toContain("fe-blocker");
   });
 
   it("test_transfer_many_when_the_first_source_delete_fails_then_nothing_leaves_the_source", async () => {

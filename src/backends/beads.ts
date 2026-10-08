@@ -229,6 +229,14 @@ function parseDependencies(
   return deps;
 }
 
+/** What a rollback left behind in the destination graph, and why. */
+interface DiscardResidue {
+  /** The rollback delete failed, or deleted nothing. */
+  stuck: string[];
+  /** Kept on purpose: deleting it would strip a surviving dependent's edge. */
+  held: string[];
+}
+
 export class BeadsStore implements Store {
   private readonly beadsDir: string;
   private readonly binary: string;
@@ -1228,7 +1236,10 @@ export class BeadsStore implements Store {
    *     left intact, the destination copies of those same ids are rolled back,
    *     and `splitTransferError` names which ids are now only in the
    *     destination, only in the source, or (rollback refused) in both — so an
-   *     operator can finish or revert the move by hand.
+   *     operator can finish or revert the move by hand. A rollback NEVER
+   *     deletes a destination row a dependent there still depends on: that
+   *     delete would silently drop the edge and its reason, which no retry
+   *     could restore. The row is kept and named instead.
    */
   private async transferManyUnlocked(
     ids: string[],
@@ -1271,11 +1282,12 @@ export class BeadsStore implements Store {
     } catch (error) {
       // Nothing has left the source yet, so the whole staged set is discarded
       // and the source is left exactly as it was.
-      const stuck = await destination.discardStaged(staged);
-      if (stuck.length > 0) {
+      const residue = await destination.discardStaged(staged);
+      const left = [...residue.stuck, ...residue.held];
+      if (left.length > 0) {
         throw rollbackResidueError(
           error,
-          stuck,
+          left,
           this.beadsDir,
           destination.beadsDir,
         );
@@ -1298,15 +1310,17 @@ export class BeadsStore implements Store {
       // detail that explains the failure being reported.
       const detail = this.lastRemovalDetail;
       const rollback = staged.filter((id) => !movedOnly.includes(id));
-      const stuck = await destination.discardStaged(rollback);
+      const residue = await destination.discardStaged(rollback);
+      const left = new Set([...residue.stuck, ...residue.held]);
       throw splitTransferError({
         failed: task.id,
         detail,
         source: this.beadsDir,
         destination: destination.beadsDir,
         movedOnly,
-        returned: rollback.filter((id) => !stuck.includes(id)),
-        stuck,
+        returned: rollback.filter((id) => !left.has(id)),
+        stuck: residue.stuck,
+        held: residue.held,
       });
     }
     return tasks;
@@ -1368,17 +1382,48 @@ export class BeadsStore implements Store {
   }
 
   /**
-   * Undo staged destination rows. Returns the ids it could NOT remove — a
-   * rollback delete can fail or silently delete nothing, and an unread result
-   * would report a clean undo while leaving the task in both graphs, so the
-   * residue is handed back for the caller to name in its error.
+   * Undo staged destination rows. Returns the ids still in this graph after the
+   * attempt, split by WHY, because an operator has to act on the two causes
+   * differently:
+   *
+   *  - `stuck`: the rollback delete failed, or exited 0 having deleted nothing.
+   *    An unread result would report a clean undo while leaving the task in
+   *    both graphs.
+   *  - `held`: removing the row would have stripped a dependency edge off a
+   *    dependent this graph still holds. Measured on bd 1.3.0, `bd delete
+   *    --force` deletes a row that still has dependents and silently drops
+   *    their edges — the same trap `removeUnlocked` guards against — and a
+   *    transfer that loses an edge and its reason is NOT recoverable by
+   *    retrying the id that failed. So the row is kept and named instead.
+   *
+   * Dependents are discarded before their blockers, so a row is only ever held
+   * for a dependent that is not itself part of this rollback.
    */
-  private async discardStaged(staged: string[]): Promise<string[]> {
+  private async discardStaged(staged: string[]): Promise<DiscardResidue> {
     const stuck: string[] = [];
-    for (const id of [...staged].reverse()) {
+    const held: string[] = [];
+    for (const id of await this.discardOrder(staged)) {
+      if ((await this.activeDependents(id)).length > 0) {
+        held.push(id);
+        continue;
+      }
       if (!(await this.removeRow(id))) stuck.push(id);
     }
-    return stuck;
+    return { stuck, held };
+  }
+
+  /**
+   * Dependents before blockers over the rollback set itself, read back out of
+   * this graph: the staging order is the caller's id order and says nothing
+   * about which of these rows depends on which. Ids already absent are skipped.
+   */
+  private async discardOrder(staged: string[]): Promise<string[]> {
+    const tasks: Task[] = [];
+    for (const id of staged) {
+      const record = await this.resolve(id);
+      if (record) tasks.push(this.toTask(record));
+    }
+    return this.removalOrder(tasks).map((task) => task.id);
   }
 
   /**
