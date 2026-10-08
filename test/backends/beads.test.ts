@@ -248,6 +248,24 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore against a disposable graph", () => {
     ).toBe(false);
   });
 
+  it("test_add_dep_when_pair_already_has_another_edge_type_then_refuses_naming_it", async () => {
+    await store.create({ id: "pair-a", title: "Pair owner" });
+    await store.create({ id: "pair-b", title: "Pair other" });
+    expect(
+      await store.addDep("pair-a", { type: "blocked-by", id: "pair-b" }),
+    ).toBe(true);
+
+    // bd stores ONE relationship type per pair, so a second type is refused
+    // with the existing edge named rather than surfacing a raw bd error.
+    await expect(
+      store.addDep("pair-a", { type: "parent", id: "pair-b" }),
+    ).rejects.toThrow(
+      /already has a blocked-by edge to "pair-b", and bd stores one relationship type per task pair/,
+    );
+    const owner = await store.get("pair-a");
+    expect(owner?.deps).toEqual([{ type: "blocked-by", id: "pair-b" }]);
+  });
+
   it("test_add_dep_when_reason_given_then_reason_survives_round_trip", async () => {
     await store.create({ id: "reason-a", title: "Reason owner" });
     await store.create({ id: "reason-b", title: "Reason blocker" });

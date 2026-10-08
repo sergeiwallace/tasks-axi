@@ -1031,6 +1031,24 @@ export class BeadsStore implements Store {
     ) {
       return false;
     }
+    // bd stores at most one relationship type per task pair and refuses a
+    // second; surface that as a clear conflict instead of a raw bd error.
+    // Restored from PR #52, whose own test froze the behaviour.
+    const conflicting = task.deps.find(
+      (existing) =>
+        existing.id === checkedDep.id && existing.type !== checkedDep.type,
+    );
+    if (conflicting) {
+      throw new AxiError(
+        `Task "${id}" already has a ${conflicting.type} edge to "${checkedDep.id}", and bd stores one relationship type per task pair`,
+        "VALIDATION_ERROR",
+        [
+          conflicting.type === "blocked-by"
+            ? `Remove the existing edge first with \`tasks-axi unblock ${id} --by ${checkedDep.id}\``
+            : `Remove the existing edge first with \`bd dep remove ${id} ${checkedDep.id}\``,
+        ],
+      );
+    }
     if (!(await this.resolve(checkedDep.id))) {
       const label = checkedDep.type === "blocked-by" ? "blocker" : "dependency";
       throw new AxiError(
