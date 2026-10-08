@@ -20,6 +20,7 @@ import {
   resolveTasksContext,
   type TasksContext,
 } from "../../src/context.js";
+import { bdAvailability } from "../beads-helpers.js";
 
 /**
  * Contract tests for the Beads-backed store (AIH-nta1e).
@@ -52,7 +53,10 @@ function hasBd(): boolean {
   return !probe.error && probe.status === 0;
 }
 
-const BD_AVAILABLE = hasBd();
+// `REQUIRE_BD=1` (what CI sets) turns the self-skip below into a hard
+// failure, so a broken bd install or a PATH regression cannot silently
+// drop this whole file's coverage and still report green.
+const BD_AVAILABLE = bdAvailability(hasBd, process.env);
 
 interface Graph {
   repo: string;
@@ -103,6 +107,19 @@ function rawShow(graph: Graph, id: string): Record<string, unknown> {
 
 function metadataOf(graph: Graph, id: string): Record<string, unknown> {
   return (rawShow(graph, id).metadata ?? {}) as Record<string, unknown>;
+}
+
+/**
+ * Does bd itself still hold the row? `rawShow` cannot answer this: it throws
+ * on a missing id, and a deletion has to be proved against the store rather
+ * than against the adapter that claims to have performed it.
+ */
+function rawExists(graph: Graph, id: string): boolean {
+  const result = spawnSync("bd", ["-C", graph.repo, "show", id, "--json"], {
+    encoding: "utf8",
+    env: BD_ENV,
+  });
+  return result.status === 0 && result.stdout.includes(`"${id}"`);
 }
 
 /**
@@ -338,6 +355,8 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore against a disposable graph", () => {
       await store.removeDep("rm-a", { type: "blocked-by", id: "rm-b" }),
     ).toBe(true);
     expect((await store.get("rm-a"))?.deps).toEqual([]);
+    // Read back from bd, not from the adapter that reported the removal.
+    expect(rawShow(graph, "rm-a").dependencies ?? []).toEqual([]);
     expect(
       await store.removeDep("rm-a", { type: "blocked-by", id: "rm-b" }),
     ).toBe(false);
@@ -506,9 +525,13 @@ describe.skipIf(!BD_AVAILABLE)("BeadsStore against a disposable graph", () => {
 
   it("test_remove_when_unblocked_then_deletes_from_the_graph", async () => {
     await store.create({ id: "gone-q1", title: "Removable" });
+    expect(rawExists(graph, "gone-q1")).toBe(true);
     const removed = await store.remove("gone-q1");
     expect(removed.id).toBe("gone-q1");
     expect(await store.get("gone-q1")).toBeNull();
+    // bd exits 0 from a delete that deleted nothing, so the row's absence is
+    // read straight from the graph rather than taken from the exit status.
+    expect(rawExists(graph, "gone-q1")).toBe(false);
   });
 
   // ---- public followups ---------------------------------------------------
