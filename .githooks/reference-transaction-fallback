@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# Veto unsafe local branch/ref deletes at Git's transaction boundary.
+set -u
+action=${1:-}
+[[ "$action" == prepared ]] || exit 0
+zero=0000000000000000000000000000000000000000
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
+# What the backup arm below authorises is not a CALLER but a JOURNALED DELETION: a
+# `refs/backup/*` recovery artifact may go only when the prune flow has already recorded a
+# write-ahead intent to delete that exact ref, so the removal stays auditable and
+# recoverable. `worktree_prune.py` exports this marker for the single `git update-ref -d`
+# call it makes, and Git passes its environment through to this hook.
+#
+# NEVER READ ARGV HERE -- not `/proc/<pid>/cmdline`, not `ps -o args`, not `ps -o command`.
+# A Dolt, `bd` or broker command line on this fleet can carry a run handle, so emitting one
+# is a secret disclosure (scripts/process_liveness.py § NEVER READS ARGV). The guarantee
+# that nothing secret can leak from this file is structural rather than careful: the only
+# value read is this marker, whose content is the ref name that the refusals below already
+# print, so every error path and log line is safe by construction.
+#
+# The superseded check read `/proc/$$/cmdline` and `/proc/$PPID/cmdline` for the pruner's
+# name. Measured 2026-09-24: macOS has no `/proc` at all, and under a real
+# `git update-ref -d` the hook's parent is `git` while the pruner is its GRANDparent -- so
+# that check could not succeed on ANY platform in production use, and everything below it
+# had never run. It looked safe because a guard that always refuses looks like a guard.
+#
+# This marker is a forgeable cooperative signal, exactly as a command line was, and is not
+# a security boundary: it refuses ACCIDENTAL deletions. The ledger row is the durable
+# authorisation.
+prune_marker=${AIH_WORKTREE_PRUNE_REF:-}
+# `git pack-refs` RELOCATES a loose ref into `packed-refs`, and the relocation REMOVES the
+# loose file. That removal is a transaction whose new value is all-zeros, so this hook read a
+# relocation as a destruction and refused it -- `pack-refs` exited 128 in every repo the
+# installer reaches, which is a regression introduced by making the hook reachable at all
+# (AIH-luzrd, downstream of AIH-fgk5y). It half-failed deterministically: step one wrote the
+# new `packed-refs`, step two was refused, leaving an identical loose duplicate per guarded
+# ref. Nothing was ever at risk -- both stores resolved -- but a loose ref WINS over a packed
+# one in Git's lookup order, so the duplicates were a standing hazard, not just clutter.
+#
+# A relocation has to be told apart from a destruction, and the two discriminators that come
+# to mind first BOTH FAIL OPEN. "Can the ref still be resolved at `prepared`?" cannot work at
+# all: Git removes the ref at `committed`, so both shapes resolve (see :101-102 below).
+# "Is the ref already in `packed-refs` at `$old`?" looks sound and is not -- deleting an
+# ALREADY-PACKED anchor with `git update-ref -d <ref> <oid>` presents exactly that state, and
+# a carve-out that waves a packed anchor's destruction through is strictly worse than the
+# noisy refusal it replaces.
+#
+# So the signature below is a CONJUNCTION, measured across eight real-Git shapes on git
+# 2.55.0. Each row is one `prepared` invocation; a shape that fires TWO of them gets two rows,
+# and the hook judges whichever arrives first:
+#
+#   shape                                        $old   lock    loose  packed==$old
+#   pack-refs relocation                         real   ABSENT  yes    yes    -> ALLOW
+#   update-ref -d <never-packed loose>           zeros  held    yes    no
+#   update-ref -d <packed only>                  zeros  held    no     no
+#   update-ref -d <packed AND loose: residue>    zeros  held    yes    no
+#   update-ref -d <ref> <oid>, unpacked          real   held    yes    no
+#   update-ref -d <ref> <oid>, ALREADY PACKED    zeros  held    no     yes   <- FIRST
+#                        "   (second invocation) real   held    no     yes
+#   update-ref --stdin delete                    zeros  held    yes    no
+#   update-ref -d, repo with NO packed-refs      zeros  held    yes    no
+#
+# THAT PENULTIMATE PAIR IS THE ONE TO READ TWICE, because it is the shape the fail-open
+# candidate above was about. Deleting an already-packed ref runs the loose backend and the
+# packed backend as SEPARATE transactions, and the loose one reports a zero pre-image even
+# though the caller asserted a real one -- so `$old` is zeros on the invocation that arrives
+# first. An earlier draft of this table recorded only the second row and concluded the lock
+# was what stood between that shape and destruction. It is not.
+#
+# NO SINGLE CONJUNCT IS LOAD-BEARING, measured: dropping any one of the four, and either
+# tested pair, leaves every genuine-deletion shape refused and the suite green. That is the
+# intended property rather than slack to trim -- each shape is refused by at least two
+# conjuncts, so the guard survives one of them being wrong about a future Git. The control
+# that proves the suite can still see a fail-open is to make this predicate `return 0`
+# unconditionally, which fails 20 tests.
+#
+# UNMEASURED, and deliberately left failing CLOSED: concurrency. Several sessions run Git at
+# once here, so an unrelated process holding `packed-refs.lock` during a `pack-refs` prune
+# makes conjunct (2) refuse a genuine relocation -- the status quo, noisy but safe. The
+# reverse cannot happen, because the lock is taken by the deleting process itself before this
+# hook runs.
+common_dir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+
+is_pack_refs_relocation() {
+  local ref=$1 old=$2 packed_oid=
+  # (1) A relocation always asserts the loose ref's current OID, because `pack-refs` must not
+  # remove a file that moved under it. Every command this guard exists to judge sends zeros
+  # instead -- `git branch -d`, `-D`, `git update-ref -d <ref>` -- so this conjunct alone
+  # already refuses them (the measurement is tabulated at :84-91 below).
+  [[ "$old" != "$zero" ]] || return 1
+  # (2) The conjunct whose polarity is counter-intuitive:
+  # `pack-refs` commits `packed-refs` and RELEASES the lock BEFORE pruning the loose files,
+  # while the files backend takes it in `files_transaction_prepare` -- before running this
+  # hook -- for every genuine deletion, including in a repo that has no `packed-refs` file at
+  # all. The discriminator is therefore lock ABSENCE. An earlier draft of this check had it
+  # backwards, which would have refused nothing and allowed everything.
+  #
+  # THE LOCK LIVES IN THE COMMON DIR, AND A LINKED WORKTREE'S `$GIT_DIR` IS NOT IT. Read
+  # through `--git-dir`, the lock is absent for EVERY transaction in a worktree -- which is
+  # where all of this fleet's work happens -- so that reading authorises every genuine
+  # deletion there. Both halves of that pair are pinned in `tests/test_ref_delete_guard.py`.
+  # An unresolvable common dir leaves `$common_dir` empty and refuses, rather than treating
+  # "no lock found here" as proof of a relocation.
+  [[ -n "$common_dir" ]] || return 1
+  [[ ! -e "$common_dir/packed-refs.lock" ]] || return 1
+  # (3) `packed-refs` must ALREADY carry this ref at exactly `$old`: the new file is written
+  # and committed before the loose files are pruned, so a relocation's destination is
+  # observable here. This is the conjunct that fails open on its own; it is kept because it
+  # refuses every shape whose pre-image is real but unpacked.
+  [[ -f "$common_dir/packed-refs" ]] || return 1
+  packed_oid=$(awk -v r="$ref" '$1 !~ /^[#^]/ && $2 == r { print $1; exit }' \
+    "$common_dir/packed-refs" 2>/dev/null)
+  [[ "$packed_oid" == "$old" ]] || return 1
+  # (4) The loose file must still exist, because removing it is what this transaction IS. A
+  # packed-only deletion has none, which refuses (3)'s fail-open shape a second time.
+  [[ -f "$common_dir/$ref" ]] || return 1
+  return 0
+}
+# A RENAME IS NOT A DESTRUCTION, AND THE GUARD COULD NOT TELL (AIH-ch44x, T-5.3 narrowing).
+#
+# `git branch -m` deletes the old ref, so every proof below judged it as a deletion -- and a
+# branch with nowhere else to be found was refused. That is not a strictness anyone chose: the
+# commits survive under the new name, so there is nothing for this hook to protect. It also
+# breaks a DOCUMENTED workflow, `docs/procedures/bms-pull-request-workflow.md`'s promote step
+# ("promote worktree-<slug> to feature/<desc> -- a rename/push"), which renames a branch whose
+# work is by definition not yet published anywhere. Measured 2026-09-24 and again here: with
+# the veto arm enabled, `git branch -m` on an unpublished branch exited 128 and the rename did
+# not happen.
+#
+# THE DISCRIMINATOR IS A POSITIVE ARTIFACT, NOT AN ABSENCE, and the three near-misses are worth
+# recording because each one FAILS OPEN:
+#
+#   "the new ref already holds the tip"  -- git's files backend deletes the old ref FIRST and
+#       writes the new one after, so at `prepared` the destination does not exist yet. Measured
+#       on git 2.54.0: during `git branch -m ren-src ren-dst`, `for-each-ref --contains` over
+#       all of `refs/` found no `ren-dst`.
+#   "some other ref reaches the tip"     -- true for a rename only by accident, and it would
+#       also wave through deleting the last branch of a shared tip.
+#   "`$old` is a real OID"               -- a rename does assert one, and so does
+#       `git update-ref -d <ref> <oid>`, which is a genuine destruction.
+#
+# What a rename DOES leave behind is git's own scratch file. `files_copy_or_rename_ref` moves
+# the old ref's reflog to `logs/refs/.tmp-renamed-log` (`TMP_RENAMED_LOG`) BEFORE deleting the
+# old ref and removes it once the new ref is written, so at `prepared` the tmp log is present
+# and the ref's own reflog is already gone. Measured across five shapes on git 2.54.0:
+#
+#   shape                                         $old   loose  own reflog  tmp-renamed-log
+#   branch -m <old> <new>                          real   yes    ABSENT      PRESENT  -> ALLOW
+#   branch -d / -D                                 zeros  yes    present     absent
+#   update-ref -d <ref> <oid>                      real   yes    present     absent
+#   update-ref -d <ref> <oid>, reflog file removed real   yes    absent      absent
+#   branch -c <src> <dst> (copy)                   -- no deletion transaction at all --
+#
+# The fourth row is why the tmp log is required rather than inferred from the missing reflog:
+# `git gc` and `git reflog expire` can remove a reflog file, and a repo with
+# `core.logAllRefUpdates=false` never had one. Reading absence as proof would authorise
+# destroying any branch in such a repo. Freshness is required for the same reason one layer
+# out: a CRASHED rename leaves the tmp log behind, and a stale one must not authorise a
+# deletion minutes or days later. `find -newermt` reports by OUTPUT, not by exit status (BSD
+# find exits 0 for a non-match), so the test is on emptiness.
+#
+# FAILS CLOSED EVERYWHERE IT CANNOT TELL: reflogs disabled, a missing `find`, an unresolvable
+# common dir, or any future Git that renames without the scratch file all leave a rename
+# refused -- noisily, which is recoverable, rather than quietly destroying work. The arm also
+# defaults to advisory, so on a machine that has not opted in the only cost is one line of
+# stderr.
+#
+# SCOPED TO `refs/heads/*` ON PURPOSE: it is invoked from that arm only, so no reasoning about
+# `refs/backup/*` changes. A recovery anchor still goes only through the journaled prune flow,
+# whatever a caller claims to be doing to it.
+is_branch_rename() {
+  local ref=$1 old=$2 tmp_log=
+  [[ "$old" != "$zero" ]] || return 1
+  [[ -n "$common_dir" ]] || return 1
+  [[ -f "$common_dir/$ref" ]] || return 1
+  [[ ! -e "$common_dir/logs/$ref" ]] || return 1
+  tmp_log="$common_dir/logs/refs/.tmp-renamed-log"
+  [[ -f "$tmp_log" ]] || return 1
+  [[ -n "$(find "$tmp_log" -newermt '-60 seconds' 2>/dev/null || true)" ]] || return 1
+  return 0
+}
+# RESOLVE THE INTEGRATION TARGET; DO NOT REQUIRE A RECORDED ONE (AIH-titkf).
+#
+# The branch arm's ancestry proof used to read `branch.<b>.aih-target` and was guarded by
+# `[[ -n "$target" ]] &&`, so on a branch without that key bash short-circuited BEFORE
+# `merge-base` ever ran: no ancestry was computed and the refusal was reached. The predicate
+# was therefore "is bookkeeping configured", printed as "is neither backed up nor integrated".
+# Measured on /data/projects/sw-bms-workspace 2026-10-05: 13 of 15 local heads carried no key
+# and 12 of those were provable ancestors of `origin/main`, so the message asserted the
+# opposite of what Git could measure for each of them, and `worktree_audit.py` and this hook
+# gave opposite answers about the same ref in the same minute.
+#
+# This is the same repair the tip resolution two arms down already records -- resolve the fact,
+# do not read a record -- applied one layer out. The key survives as an OVERRIDE for a branch
+# whose target is not the default (sw-bms-workspace targets `origin/sergei/dev-workspace`,
+# `config/worktree_policy.yaml`), which is the only thing it was ever able to express.
+#
+# The fallback chain is CLOSED and ends in failure rather than in a local ref:
+# `refs/remotes/origin/HEAD` when it is set AND resolves, else `refs/remotes/origin/main`, else
+# nothing -- and nothing means the ancestry proof cannot be attempted, which refuses. A local
+# `refs/heads/main` is deliberately NOT in the chain: in a worktree-per-session fleet it can
+# sit arbitrarily far behind the published trunk, so "merged into my stale local main" is not
+# the question anyone is asking.
+resolve_integration_target() {
+  local branch=$1 recorded resolved
+  recorded=$(git -C "$repo" config --get "branch.$branch.aih-target" 2>/dev/null </dev/null || true)
+  if [[ -n "$recorded" ]]; then
+    printf '%s\n' "$recorded"
+    return 0
+  fi
+  resolved=$(git -C "$repo" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null </dev/null || true)
+  if [[ -n "$resolved" ]] &&
+    git -C "$repo" rev-parse --verify --quiet "$resolved" >/dev/null 2>&1 </dev/null; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+  if git -C "$repo" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1 </dev/null; then
+    printf 'refs/remotes/origin/main\n'
+    return 0
+  fi
+  return 1
+}
+# Where this fleet's durable anchors live. `refs/backup/` is what `worktree_audit.py`'s
+# `_anchor_worktree_branch` and the reap paths write, `refs/aih-backup/` is what
+# `worktree_backup.py` fetches a published tip into, and `refs/preserved/` is what a session
+# writes by hand before asking for a reap. It is `worktree_audit.SUPERSESSION_ANCHOR_NAMESPACES`
+# plus `refs/aih-backup`, and CLOSED for the same two reasons that list states:
+# `refs/heads/<branch>` is the tip itself and would make the proof vacuous, and a
+# remote-tracking ref is a copy of somebody else's state that a prune can delete without
+# warning (AIH-lzesq), so neither namespace is a durability proof.
+anchor_namespaces=(refs/backup refs/aih-backup refs/preserved)
+# CONTAINMENT, NEVER EQUALITY. The config-keyed proof below asks `rev-parse <ref> == $tip`,
+# and kg-3 measured a branch whose tip was contained by 9 `refs/backup/**` refs and EQUAL to
+# exactly 1: an anchor whose ref has since advanced past the tip is the normal case, so an
+# equality test would reject 8 of 9 perfectly good records of that commit. `--contains`
+# answers the question that matters -- is this commit still reachable from something durable
+# -- and a zero `$tip` is refused before the walk rather than passed to Git as an object.
+#
+# THE SAME QUESTION, ASKED THE SAME WAY, as `worktree_anchor_sweep.py`'s `_may_be_anchored`:
+# `for-each-ref --contains=<tip> --count=1 --format=%(refname)` over the anchor namespaces.
+# That is deliberate rather than coincidental -- AIH-titkf exists because this hook and
+# `worktree_audit.py` gave opposite answers about one ref in one minute -- so a future change
+# to either should move both. The one difference is `refs/aih-backup`, which the sweep does not
+# need and `worktree_backup.py:348` writes.
+anchor_containing_tip() {
+  local tip=$1
+  [[ -n "$tip" && "$tip" != "$zero" ]] || return 1
+  local found
+  # The `${arr[@]+...}` guard is not decoration: on bash 3.2, which is macOS's /bin/bash,
+  # `set -u` treats an EMPTY array's expansion as an unbound variable, so an edit that
+  # emptied the list above would make this hook DIE at this line -- refusing every branch
+  # deletion on every Mac, which is this file's own twice-repeated failure shape.
+  # `tests/test_shell_bash32_portability.py` caught exactly this in the unguarded first
+  # draft of this function.
+  found=$(git -C "$repo" for-each-ref --contains="$tip" --count=1 --format='%(refname)' \
+    ${anchor_namespaces[@]+"${anchor_namespaces[@]}"} 2>/dev/null </dev/null || true)
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+# THE TWO ARMS HAVE DIFFERENT BLAST RADII, SO THEY SHIP SEPARATELY (AIH-fgk5y).
+#
+# The `refs/backup/*` arm enforces a rule the fleet already states as absolute -- a recovery
+# anchor may go only through the journaled prune flow -- and nothing else can reach it, so it
+# is always active.
+#
+# The `refs/heads/*` arm is a behaviour change for every session on every machine: it decides
+# whether a branch deletion destroys the only copy of some work, and a branch whose content is
+# nowhere else is refused. It vetoes only when
+#
+#   git config --global aih.refDeleteBranchArm enabled
+#
+# is in effect, and install.sh writes exactly that on every machine (AIH-rkdk3: Sergei,
+# 2026-10-12, "turn it on everywhere now"). With the key unset -- a host install.sh has not
+# reached -- the arm still computes every containment proof and says what it would have
+# refused, on stderr, but does not veto the transaction. `git config --get` reads every
+# scope, so the single global value covers the fleet. Advisory rather than silent when unset
+# on purpose: a silent state would make the arm's reachability unobservable until the day it
+# refuses something.
+branch_arm=$(git -C "$repo" config --get aih.refDeleteBranchArm 2>/dev/null || true)
+while read -r old new ref; do
+  [[ "$new" == "$zero" ]] || continue
+  # Judged before EITHER arm, because a relocation is not the branch arm's business either:
+  # while advisory it printed one "deletion ALLOWED" line per branch during a `pack-refs`,
+  # naming branches nobody was deleting -- `main` among them -- and enabling the veto would
+  # have turned each of those into a hard refusal of `pack-refs` on `refs/heads/*`. One
+  # predicate removes the noise and that AIH-fgk5y item-2 blocker together.
+  is_pack_refs_relocation "$ref" "$old" && continue
+  case "$ref" in
+    refs/backup/*)
+      # Marker scoped to this one ref: a marker left in the environment by an unrelated
+      # prune of some other artifact must not authorise deleting this one.
+      if [[ "$prune_marker" != "$ref" ]]; then
+        printf 'worktree ref deletion refused: only the worktree pruner may delete %s\n' "$ref" >&2
+        exit 1
+      fi
+      # A pruner deletion is valid only for a recorded recovery artifact.
+      state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}
+      ledger="$state_root/ai-harness/worktree-reaps/$(basename "$repo").jsonl"
+      # The LATEST row for this ref must be the write-ahead `prune_intent`, which
+      # `_delete_artifacts` appends immediately before the deletion. Matching any row that
+      # merely NAMES the ref accepted `hold`, `kept` and `prune_warned` -- rows that record
+      # a decision NOT to delete -- and accepted a stale intent from an earlier generation
+      # of a recreated ref. The closing quote in the pattern keeps `<ref>` from borrowing
+      # the row of a longer ref it prefixes. Per-line conjunction, not adjacency, so key
+      # order in the JSON does not matter.
+      last_row=
+      [[ -f "$ledger" ]] && last_row=$(grep -F "\"backup_ref\": \"$ref\"" "$ledger" | tail -n 1)
+      case "$last_row" in
+        *'"event": "prune_intent"'*) ;;
+        *)
+          printf 'worktree backup deletion refused: no ledger row for %s\n' "$ref" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    refs/heads/*)
+      branch=${ref#refs/heads/}
+      # Judged before every proof, and before the advisory, because a rename destroys nothing:
+      # an advisory line naming a branch nobody is deleting is the same noise the relocation
+      # predicate above was moved ahead of both arms to remove.
+      is_branch_rename "$ref" "$old" && continue
+      # RESOLVE THE TIP; DO NOT TRUST `$old`. Git reports a pre-image OID only when the
+      # CALLER asserts one. Measured on git 2.54.0 (Apple Git-157), 2026-09-24:
+      #
+      #   git branch -d <b>              -> old=0{40}
+      #   git branch -D <b>              -> old=0{40}
+      #   git update-ref -d <ref>        -> old=0{40}
+      #   git update-ref -d <ref> <old>  -> old=<real OID>
+      #   git branch -m <old> <new>      -> old=<real OID>
+      #
+      # `git branch -d` and `-D` are the exact commands this arm exists to judge, and
+      # both send zeros -- so a zero `$old` failed BOTH containment proofs below and the
+      # arm refused every branch deletion regardless of its backup or integration state.
+      # The suite missed it because its branch-arm fixture feeds a synthetic non-zero
+      # `old` that real git never sends for those commands.
+      #
+      # This is the same defect shape as the superseded `/proc` check above -- a wrong
+      # model of how Git invokes the hook, hidden behind a guard that looked correct
+      # because it always refused. The ref is still fully resolvable at the `prepared`
+      # stage (Git removes it at `committed`), so the tip is recovered from the ref name,
+      # which is what the design specified from the start: "the hook sees the ref name,
+      # so it resolves the tip itself before the transaction" (AIH-22oy enforcement
+      # matrix). `$old` remains the fallback for the callers that do assert one.
+      tip=$(git -C "$repo" rev-parse --verify --quiet "$ref" 2>/dev/null || true)
+      [[ -n "$tip" ]] || tip=$old
+      backup=$(git -C "$repo" config --get "branch.$branch.aih-backup" 2>/dev/null || true)
+      backup_ref=
+      if [[ "$backup" == *:refs/heads/* ]]; then
+        backup_ref="refs/remotes/${backup%%:*}/${backup#*:refs/heads/}"
+      fi
+      # PROOF 1, unchanged: the destination this branch's own tracking config RECORDS, at
+      # exactly the tip. That is the fleet's ratified durability proof (D-2 of the lifecycle
+      # design) and it is a deliberate per-branch statement, which is what separates it from
+      # the remote-tracking refs the containment proof below refuses to count.
+      if [[ -n "$backup_ref" ]] && [[ "$(git -C "$repo" rev-parse --verify "$backup_ref" 2>/dev/null || true)" == "$tip" ]]; then
+        continue
+      fi
+      # PROOF 2: ancestry, against a target this hook RESOLVES. An unresolvable target leaves
+      # `$target` empty, which cannot be proved and so refuses -- "nowhere to compare against"
+      # is not a pass.
+      target=$(resolve_integration_target "$branch") || target=
+      if [[ -n "$target" ]] && git -C "$repo" merge-base --is-ancestor "$tip" "$target" 2>/dev/null; then
+        continue
+      fi
+      # PROOF 3: a durable anchor still REACHES the tip, wherever this fleet's reap paths put
+      # it. The mechanism that creates our backups and the mechanism that checked for one did
+      # not meet before this: the writer puts them under `refs/backup/**` and the proof above
+      # consults only a config-recorded remote.
+      anchor=$(anchor_containing_tip "$tip") || anchor=
+      if [[ -n "$anchor" ]]; then
+        continue
+      fi
+      # PROOF 4: shipment by CONTENT, which is the only one a squash merge leaves standing
+      # (AIH-r4v9h). A squash replays the branch as ONE new commit with no parent link to the
+      # tip, so proof 2's ancestry cannot hold however well the target was resolved. Measured
+      # live the day this hook first deployed: the just-merged PR branch printed "neither
+      # backed up nor integrated", and survived only because the arm was advisory. Enabling
+      # the veto without this proof would refuse the single most routine deletion in the
+      # fleet, on every PR branch in this repo.
+      #
+      # Delegated rather than inlined because the question needs a tree walk and this is bash.
+      # `content_integration_proof` is the REAP GATE's own bar -- the predicate this repo
+      # already trusts to authorise destroying a worktree -- and it answers by POSITIVE
+      # content match: every touched path's blob equal to the target's, every novel blob
+      # reachable from the target. An emptiness check would not do, because a deletion-only,
+      # binary or mode-only change adds no lines either (AIH-xzjt2), and a branch with no
+      # touched paths is answered "cannot tell" rather than vacuously shipped.
+      #
+      # RESOLVED FROM THE MAIN WORKTREE ROOT, NOT `$repo`. All of this fleet's work happens in
+      # linked worktrees, whose checkout need not carry the script at all -- it may predate it
+      # -- while the main tree always does. The distinction is invisible in a scratch repo,
+      # where `--git-dir` IS `--git-common-dir`, which is exactly how a fail-open nearly
+      # shipped in the relocation discriminator above; `tests/test_ref_delete_guard.py` seeds
+      # the helper in the main tree ONLY so the worktree case is a discriminator.
+      #
+      # `</dev/null` IS LOAD-BEARING. This hook has unread transaction records on fd 0 and the
+      # helper is its child, so one stray read there would consume records the loop has not
+      # judged yet -- invisibly, since the hook would simply judge fewer refs and exit 0. The
+      # helper also reads no stdin of its own; both halves are deliberate.
+      #
+      # Cost: one `rev-list --objects` over the target, 0.4s on ai-harness's 61k objects, and
+      # 0.155s end-to-end for the whole helper on a real unshipped branch, which refuses at
+      # the first differing path before reaching that walk (measured 2026-10-02). Reached only
+      # after both cheap proofs fail, and never during a `pack-refs`, which the relocation
+      # signature short-circuits before either arm.
+      #
+      # MEASURED, AND STATED RATHER THAN IMPLIED: of the five clauses here and in the helper,
+      # FOUR are load-bearing and the `-f` test is NOT. Mutating each one and running
+      # `tests/test_ref_delete_guard.py`: making the predicate return success unconditionally
+      # fails 5 tests plus 1 error; resolving the helper from `$repo` instead of the main
+      # worktree root fails 1; weakening the helper's `integrated is True` to `is not False`
+      # fails 1; treating an unresolvable target as proof fails 1. Dropping the `-f` test
+      # leaves the suite GREEN, because `python3 <missing-path>` exits 2 and the deletion is
+      # refused anyway -- so that clause is defence in depth (and it keeps a missing script
+      # from printing a traceback at every branch deletion), not the thing standing between a
+      # missing helper and a destruction. The companion test still asserts the real
+      # behaviour; it is simply satisfied by two independent mechanisms.
+      #
+      # THE HELPER IS AI-HARNESS'S, NOT THE DELETING REPO'S (AIH-pz2yd). install.sh deploys
+      # this hook into every repo that ships or adopts it, but only ai-harness ships the
+      # helper, so a `$repo`-relative lookup alone refused every squash-merged branch in
+      # sw-bms-workspace with "no content proof available". install.sh therefore records its
+      # own main-tree root as `aih.harnessRoot`, and a configured root is AUTHORITATIVE: a
+      # helper missing there refuses rather than falling back to whatever `$repo` carries
+      # under the same name. Unset -- a host install.sh has not reached -- keeps the
+      # main-worktree-root lookup above, which is the right answer inside ai-harness itself.
+      # A config read, never argv (the NEVER READ ARGV note at the top).
+      proof_root=$(git -C "$repo" config --type=path --get aih.harnessRoot 2>/dev/null </dev/null || true)
+      if [[ -z "$proof_root" ]]; then
+        proof_root=$repo
+        [[ "$common_dir" == */.git ]] && proof_root=${common_dir%/.git}
+      fi
+      proof_helper="$proof_root/scripts/ref_delete_content_proof.py"
+      if [[ -f "$proof_helper" ]] &&
+        python3 "$proof_helper" "$repo" "$ref" </dev/null 2>/dev/null; then
+        continue
+      fi
+      # NAME THE PREDICATE THAT FAILED, not the disjunction of all of them (AIH-titkf AC-3).
+      # "is neither backed up nor integrated" was one sentence for four different operator
+      # actions, and while the ancestry proof was keyed on a config read it was additionally
+      # FALSE for the commonest case: the branch WAS an ancestor of the published trunk and
+      # nothing had measured that. "no aih-target configured" and "not an ancestor of
+      # refs/remotes/origin/main" send a reader in opposite directions -- record the target, or
+      # ship the commits -- so the refusal states each proof's own outcome, and the resolved
+      # target and the namespaces searched are named rather than implied, because the next
+      # reader's first question is which ref the answer was computed against.
+      if [[ -n "$target" ]]; then
+        integration_failure="not an ancestor of $target"
+      else
+        integration_failure="no integration target resolved (branch.$branch.aih-target unset, and neither refs/remotes/origin/HEAD nor refs/remotes/origin/main resolves)"
+      fi
+      if [[ -f "$proof_helper" ]]; then
+        content_failure="no content match on the target"
+      else
+        content_failure="no content proof available ($proof_helper is missing)"
+      fi
+      reason=$(printf '%s at %s: %s; not contained by any anchor under %s; %s' \
+        "$branch" "$tip" "$integration_failure" \
+        "${anchor_namespaces[*]+"${anchor_namespaces[*]}"}" "$content_failure")
+      if [[ "$branch_arm" != enabled ]]; then
+        printf 'worktree branch deletion ALLOWED, advisory only: %s; enable the veto with `git config --global aih.refDeleteBranchArm enabled`\n' "$reason" >&2
+        continue
+      fi
+      printf 'worktree branch deletion refused: %s\n' "$reason" >&2
+      exit 1
+      ;;
+  esac
+done
+exit 0
