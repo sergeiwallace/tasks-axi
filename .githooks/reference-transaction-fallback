@@ -201,6 +201,10 @@ is_branch_rename() {
 # `refs/heads/main` is deliberately NOT in the chain: in a worktree-per-session fleet it can
 # sit arbitrarily far behind the published trunk, so "merged into my stale local main" is not
 # the question anyone is asking.
+# After this target fails, ancestry and content also try resolving pushed trunks, in
+# `init.defaultBranch`, main, master order, without duplicates (AIH-6pj19). Those fallbacks
+# are remote refs only and still end in failure. They do not newly authorise deleting the
+# integration branch named by origin/HEAD itself; its existing proofs must suffice.
 resolve_integration_target() {
   local branch=$1 recorded resolved
   recorded=$(git -C "$repo" config --get "branch.$branch.aih-target" 2>/dev/null </dev/null || true)
@@ -219,6 +223,22 @@ resolve_integration_target() {
     return 0
   fi
   return 1
+}
+pushed_trunk_fallback_targets() {
+  local branch=$2 head configured name candidate seen="|$1|"
+  head=$(git -C "$repo" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null </dev/null || true)
+  [[ "$head" == "refs/remotes/origin/$branch" ]] && return 0
+  # Mirror worktree_audit.pushed_trunk_targets; never substitute a local branch.
+  configured=$(git -C "$repo" config --get init.defaultBranch 2>/dev/null </dev/null || true)
+  for name in "$configured" main master; do
+    [[ -n "$name" ]] || continue
+    candidate="refs/remotes/origin/$name"
+    case "$seen" in *"|$candidate|"*) continue ;; esac
+    seen="$seen$candidate|"
+    if git -C "$repo" rev-parse --verify --quiet "$candidate" >/dev/null 2>&1 </dev/null; then
+      printf '%s\n' "$candidate"
+    fi
+  done
 }
 # Where this fleet's durable anchors live. `refs/backup/` is what `worktree_audit.py`'s
 # `_anchor_worktree_branch` and the reap paths write, `refs/aih-backup/` is what
@@ -355,13 +375,19 @@ while read -r old new ref; do
       if [[ -n "$backup_ref" ]] && [[ "$(git -C "$repo" rev-parse --verify "$backup_ref" 2>/dev/null || true)" == "$tip" ]]; then
         continue
       fi
-      # PROOF 2: ancestry, against a target this hook RESOLVES. An unresolvable target leaves
-      # `$target` empty, which cannot be proved and so refuses -- "nowhere to compare against"
-      # is not a pass.
+      # PROOF 2: ancestry, against the resolved target first, then pushed trunk fallbacks.
+      # No resolving candidate means no proof -- "nowhere to compare against" is not a pass.
       target=$(resolve_integration_target "$branch") || target=
       if [[ -n "$target" ]] && git -C "$repo" merge-base --is-ancestor "$tip" "$target" 2>/dev/null; then
         continue
       fi
+      tried_trunks=
+      while read -r candidate; do
+        tried_trunks="${tried_trunks:+$tried_trunks }$candidate"
+        if git -C "$repo" merge-base --is-ancestor "$tip" "$candidate" 2>/dev/null </dev/null; then
+          continue 2
+        fi
+      done < <(pushed_trunk_fallback_targets "$target" "$branch")
       # PROOF 3: a durable anchor still REACHES the tip, wherever this fleet's reap paths put
       # it. The mechanism that creates our backups and the mechanism that checked for one did
       # not meet before this: the writer puts them under `refs/backup/**` and the proof above
@@ -448,6 +474,9 @@ while read -r old new ref; do
         integration_failure="not an ancestor of $target"
       else
         integration_failure="no integration target resolved (branch.$branch.aih-target unset, and neither refs/remotes/origin/HEAD nor refs/remotes/origin/main resolves)"
+      fi
+      if [[ -n "$tried_trunks" ]]; then
+        integration_failure="$integration_failure; tried pushed trunks: $tried_trunks"
       fi
       if [[ -f "$proof_helper" ]]; then
         content_failure="no content match on the target"
