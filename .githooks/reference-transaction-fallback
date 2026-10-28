@@ -121,7 +121,7 @@ is_pack_refs_relocation() {
 # `git branch -m` deletes the old ref, so every proof below judged it as a deletion -- and a
 # branch with nowhere else to be found was refused. That is not a strictness anyone chose: the
 # commits survive under the new name, so there is nothing for this hook to protect. It also
-# breaks a DOCUMENTED workflow, `docs/procedures/bms-pull-request-workflow.md`'s promote step
+# breaks a DOCUMENTED workflow, the shared-repo pull request procedure's promote step
 # ("promote worktree-<slug> to feature/<desc> -- a rename/push"), which renames a branch whose
 # work is by definition not yet published anywhere. Measured 2026-09-24 and again here: with
 # the veto arm enabled, `git branch -m` on an unpublished branch exited 128 and the rename did
@@ -185,14 +185,14 @@ is_branch_rename() {
 # `[[ -n "$target" ]] &&`, so on a branch without that key bash short-circuited BEFORE
 # `merge-base` ever ran: no ancestry was computed and the refusal was reached. The predicate
 # was therefore "is bookkeeping configured", printed as "is neither backed up nor integrated".
-# Measured on /data/projects/sw-bms-workspace 2026-10-05: 13 of 15 local heads carried no key
+# Measured on one fleet workspace repo 2026-10-05: 13 of 15 local heads carried no key
 # and 12 of those were provable ancestors of `origin/main`, so the message asserted the
 # opposite of what Git could measure for each of them, and `worktree_audit.py` and this hook
 # gave opposite answers about the same ref in the same minute.
 #
 # This is the same repair the tip resolution two arms down already records -- resolve the fact,
 # do not read a record -- applied one layer out. The key survives as an OVERRIDE for a branch
-# whose target is not the default (sw-bms-workspace targets `origin/sergei/dev-workspace`,
+# whose target is not the default (a workspace repo that targets a long-lived dev branch,
 # `config/worktree_policy.yaml`), which is the only thing it was ever able to express.
 #
 # The fallback chain is CLOSED and ends in failure rather than in a local ref:
@@ -250,7 +250,7 @@ pushed_trunk_fallback_targets() {
 # warning, so neither namespace is a durability proof.
 anchor_namespaces=(refs/backup refs/aih-backup refs/preserved)
 # CONTAINMENT, NEVER EQUALITY. The config-keyed proof below asks `rev-parse <ref> == $tip`,
-# and kg-3 measured a branch whose tip was contained by 9 `refs/backup/**` refs and EQUAL to
+# and one session measured a branch whose tip was contained by 9 `refs/backup/**` refs and EQUAL to
 # exactly 1: an anchor whose ref has since advanced past the tip is the normal case, so an
 # equality test would reject 8 of 9 perfectly good records of that commit. `--contains`
 # answers the question that matters -- is this commit still reachable from something durable
@@ -445,7 +445,7 @@ while read -r old new ref; do
       # THE HELPER IS AI-HARNESS'S, NOT THE DELETING REPO'S. install.sh deploys
       # this hook into every repo that ships or adopts it, but only ai-harness ships the
       # helper, so a `$repo`-relative lookup alone refused every squash-merged branch in
-      # sw-bms-workspace with "no content proof available". install.sh therefore records its
+      # a workspace repo with "no content proof available". install.sh therefore records its
       # own main-tree root as `aih.harnessRoot`, and a configured root is AUTHORITATIVE: a
       # helper missing there refuses rather than falling back to whatever `$repo` carries
       # under the same name. Unset -- a host install.sh has not reached -- keeps the
