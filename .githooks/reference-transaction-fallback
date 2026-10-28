@@ -32,7 +32,7 @@ prune_marker=${AIH_WORKTREE_PRUNE_REF:-}
 # loose file. That removal is a transaction whose new value is all-zeros, so this hook read a
 # relocation as a destruction and refused it -- `pack-refs` exited 128 in every repo the
 # installer reaches, which is a regression introduced by making the hook reachable at all
-# (AIH-luzrd, downstream of AIH-fgk5y). It half-failed deterministically: step one wrote the
+# (a follow-on of the ref-delete guard rollout). It half-failed deterministically: step one wrote the
 # new `packed-refs`, step two was refused, leaving an identical loose duplicate per guarded
 # ref. Nothing was ever at risk -- both stores resolved -- but a loose ref WINS over a packed
 # one in Git's lookup order, so the duplicates were a standing hazard, not just clutter.
@@ -116,7 +116,7 @@ is_pack_refs_relocation() {
   [[ -f "$common_dir/$ref" ]] || return 1
   return 0
 }
-# A RENAME IS NOT A DESTRUCTION, AND THE GUARD COULD NOT TELL (AIH-ch44x, T-5.3 narrowing).
+# A RENAME IS NOT A DESTRUCTION, AND THE GUARD COULD NOT TELL (the T-5.3 narrowing).
 #
 # `git branch -m` deletes the old ref, so every proof below judged it as a deletion -- and a
 # branch with nowhere else to be found was refused. That is not a strictness anyone chose: the
@@ -179,7 +179,7 @@ is_branch_rename() {
   [[ -n "$(find "$tmp_log" -newermt '-60 seconds' 2>/dev/null || true)" ]] || return 1
   return 0
 }
-# RESOLVE THE INTEGRATION TARGET; DO NOT REQUIRE A RECORDED ONE (AIH-titkf).
+# RESOLVE THE INTEGRATION TARGET; DO NOT REQUIRE A RECORDED ONE.
 #
 # The branch arm's ancestry proof used to read `branch.<b>.aih-target` and was guarded by
 # `[[ -n "$target" ]] &&`, so on a branch without that key bash short-circuited BEFORE
@@ -202,7 +202,7 @@ is_branch_rename() {
 # sit arbitrarily far behind the published trunk, so "merged into my stale local main" is not
 # the question anyone is asking.
 # After this target fails, ancestry and content also try resolving pushed trunks, in
-# `init.defaultBranch`, main, master order, without duplicates (AIH-6pj19). Those fallbacks
+# `init.defaultBranch`, main, master order, without duplicates. Those fallbacks
 # are remote refs only and still end in failure. They do not newly authorise deleting the
 # integration branch named by origin/HEAD itself; its existing proofs must suffice.
 resolve_integration_target() {
@@ -247,7 +247,7 @@ pushed_trunk_fallback_targets() {
 # plus `refs/aih-backup`, and CLOSED for the same two reasons that list states:
 # `refs/heads/<branch>` is the tip itself and would make the proof vacuous, and a
 # remote-tracking ref is a copy of somebody else's state that a prune can delete without
-# warning (AIH-lzesq), so neither namespace is a durability proof.
+# warning, so neither namespace is a durability proof.
 anchor_namespaces=(refs/backup refs/aih-backup refs/preserved)
 # CONTAINMENT, NEVER EQUALITY. The config-keyed proof below asks `rev-parse <ref> == $tip`,
 # and kg-3 measured a branch whose tip was contained by 9 `refs/backup/**` refs and EQUAL to
@@ -258,7 +258,7 @@ anchor_namespaces=(refs/backup refs/aih-backup refs/preserved)
 #
 # THE SAME QUESTION, ASKED THE SAME WAY, as `worktree_anchor_sweep.py`'s `_may_be_anchored`:
 # `for-each-ref --contains=<tip> --count=1 --format=%(refname)` over the anchor namespaces.
-# That is deliberate rather than coincidental -- AIH-titkf exists because this hook and
+# That is deliberate rather than coincidental -- the integration-target fix exists because this hook and
 # `worktree_audit.py` gave opposite answers about one ref in one minute -- so a future change
 # to either should move both. The one difference is `refs/aih-backup`, which the sweep does not
 # need and `worktree_backup.py:348` writes.
@@ -277,7 +277,7 @@ anchor_containing_tip() {
   [[ -n "$found" ]] || return 1
   printf '%s\n' "$found"
 }
-# THE TWO ARMS HAVE DIFFERENT BLAST RADII, SO THEY SHIP SEPARATELY (AIH-fgk5y).
+# THE TWO ARMS HAVE DIFFERENT BLAST RADII, SO THEY SHIP SEPARATELY.
 #
 # The `refs/backup/*` arm enforces a rule the fleet already states as absolute -- a recovery
 # anchor may go only through the journaled prune flow -- and nothing else can reach it, so it
@@ -289,7 +289,7 @@ anchor_containing_tip() {
 #
 #   git config --global aih.refDeleteBranchArm enabled
 #
-# is in effect, and install.sh writes exactly that on every machine (AIH-rkdk3: Sergei,
+# is in effect, and install.sh writes exactly that on every machine (Sergei,
 # 2026-10-12, "turn it on everywhere now"). With the key unset -- a host install.sh has not
 # reached -- the arm still computes every containment proof and says what it would have
 # refused, on stderr, but does not veto the transaction. `git config --get` reads every
@@ -303,7 +303,7 @@ while read -r old new ref; do
   # while advisory it printed one "deletion ALLOWED" line per branch during a `pack-refs`,
   # naming branches nobody was deleting -- `main` among them -- and enabling the veto would
   # have turned each of those into a hard refusal of `pack-refs` on `refs/heads/*`. One
-  # predicate removes the noise and that AIH-fgk5y item-2 blocker together.
+  # predicate removes the noise and that rollout's item-2 blocker together.
   is_pack_refs_relocation "$ref" "$old" && continue
   case "$ref" in
     refs/backup/*)
@@ -359,8 +359,8 @@ while read -r old new ref; do
       # because it always refused. The ref is still fully resolvable at the `prepared`
       # stage (Git removes it at `committed`), so the tip is recovered from the ref name,
       # which is what the design specified from the start: "the hook sees the ref name,
-      # so it resolves the tip itself before the transaction" (AIH-22oy enforcement
-      # matrix). `$old` remains the fallback for the callers that do assert one.
+      # so it resolves the tip itself before the transaction" (the design's
+      # enforcement matrix). `$old` remains the fallback for the callers that do assert one.
       tip=$(git -C "$repo" rev-parse --verify --quiet "$ref" 2>/dev/null || true)
       [[ -n "$tip" ]] || tip=$old
       backup=$(git -C "$repo" config --get "branch.$branch.aih-backup" 2>/dev/null || true)
@@ -397,7 +397,7 @@ while read -r old new ref; do
         continue
       fi
       # PROOF 4: shipment by CONTENT, which is the only one a squash merge leaves standing
-      # (AIH-r4v9h). A squash replays the branch as ONE new commit with no parent link to the
+      # (the squash-merge proof). A squash replays the branch as ONE new commit with no parent link to the
       # tip, so proof 2's ancestry cannot hold however well the target was resolved. Measured
       # live the day this hook first deployed: the just-merged PR branch printed "neither
       # backed up nor integrated", and survived only because the arm was advisory. Enabling
@@ -409,7 +409,7 @@ while read -r old new ref; do
       # already trusts to authorise destroying a worktree -- and it answers by POSITIVE
       # content match: every touched path's blob equal to the target's, every novel blob
       # reachable from the target. An emptiness check would not do, because a deletion-only,
-      # binary or mode-only change adds no lines either (AIH-xzjt2), and a branch with no
+      # binary or mode-only change adds no lines either, and a branch with no
       # touched paths is answered "cannot tell" rather than vacuously shipped.
       #
       # RESOLVED FROM THE MAIN WORKTREE ROOT, NOT `$repo`. All of this fleet's work happens in
@@ -442,7 +442,7 @@ while read -r old new ref; do
       # missing helper and a destruction. The companion test still asserts the real
       # behaviour; it is simply satisfied by two independent mechanisms.
       #
-      # THE HELPER IS AI-HARNESS'S, NOT THE DELETING REPO'S (AIH-pz2yd). install.sh deploys
+      # THE HELPER IS AI-HARNESS'S, NOT THE DELETING REPO'S. install.sh deploys
       # this hook into every repo that ships or adopts it, but only ai-harness ships the
       # helper, so a `$repo`-relative lookup alone refused every squash-merged branch in
       # sw-bms-workspace with "no content proof available". install.sh therefore records its
@@ -461,7 +461,7 @@ while read -r old new ref; do
         python3 "$proof_helper" "$repo" "$ref" </dev/null 2>/dev/null; then
         continue
       fi
-      # NAME THE PREDICATE THAT FAILED, not the disjunction of all of them (AIH-titkf AC-3).
+      # NAME THE PREDICATE THAT FAILED, not the disjunction of all of them.
       # "is neither backed up nor integrated" was one sentence for four different operator
       # actions, and while the ancestry proof was keyed on a config read it was additionally
       # FALSE for the commonest case: the branch WAS an ancestor of the published trunk and

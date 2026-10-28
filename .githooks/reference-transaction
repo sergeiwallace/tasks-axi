@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fleet ref-delete guard wrapper (AIH-zgwrk). ai-harness's install writes this file and its
+# Fleet ref-delete guard wrapper. ai-harness's install writes this file and its
 # fallback into every repo under the projects root; edit the source in ai-harness
 # (.githooks/fleet/reference-transaction), never a deployed copy.
 #
